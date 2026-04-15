@@ -1205,6 +1205,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
     result->flags = tensor->flags;
     result->data = reinterpret_cast<void *>(tensor->data);
+    result->weight_buffer = (result->view_src == nullptr &&
+                             result->data != nullptr &&
+                             result->buffer != nullptr &&
+                             ggml_backend_buffer_get_usage(result->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+                                ? result->buffer
+                                : nullptr;
     ggml_set_name(result, tensor->name);
     return result;
 }

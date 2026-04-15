@@ -1978,6 +1978,7 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor->view_src->data != NULL);
 
     tensor->buffer = tensor->view_src->buffer;
+    tensor->weight_buffer = NULL;
     tensor->data = (char *)tensor->view_src->data + tensor->view_offs;
     return ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
 }
@@ -1993,6 +1994,11 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct 
         (char *) ggml_backend_buffer_get_base(buffer) + ggml_backend_buffer_get_size(buffer));
 
     tensor->buffer = buffer;
+    tensor->weight_buffer = (tensor->view_src == NULL &&
+                             addr != NULL &&
+                             ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+                                ? buffer
+                                : NULL;
     tensor->data = addr;
     return ggml_backend_buffer_init_tensor(buffer, tensor);
 }

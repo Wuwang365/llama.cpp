@@ -216,6 +216,7 @@ static inline const ggml_tensor * apir_decode_ggml_tensor_inplace(apir_decoder *
     // tensor->buffer is a pointer to a buffer. Decode the buffer handle encoded in sequence.
     if (tensor->buffer) {
         tensor->buffer = apir_decode_ggml_buffer(dec);
+        tensor->weight_buffer = nullptr;
     }
 
     if (tensor->view_src) {

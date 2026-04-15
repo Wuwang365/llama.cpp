@@ -1021,9 +1021,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     // create a temporary dummy buffer for the weight so that supports_op can check the buffer type
     GGML_ASSERT(w->buffer == nullptr);
     w->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
+    w->weight_buffer = nullptr;
     bool op_supported = ggml_backend_dev_supports_op(dev, op_tensor);
     ggml_backend_buffer_free(w->buffer);
     w->buffer = nullptr;
+    w->weight_buffer = nullptr;
 
     return op_supported;
 }
@@ -1429,6 +1431,7 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
+    ggml_backend_buffer_t first_model_buf = bufs.empty() ? nullptr : bufs.begin()->second;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
@@ -1436,7 +1439,7 @@ bool llama_model_loader::load_all_data(
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
         // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.count(0) ? bufs.at(0) : nullptr;
+        auto * buf = first_model_buf;
         if (!buf) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
@@ -1507,7 +1510,7 @@ bool llama_model_loader::load_all_data(
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
+            ggml_backend_buft_name(ggml_backend_buffer_get_type(first_model_buf)),
             ggml_backend_name(upload_backend));
     }
 
@@ -1541,7 +1544,16 @@ bool llama_model_loader::load_all_data(
             }
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
-            if (buf_mmap && cur->data == nullptr) {
+            if (cur->data == data) {
+                // tensor already directly maps the source file region; no copy required
+                if (lmlocks) {
+                    const auto & lmlock = lmlocks->at(weight->idx);
+                    lmlock->grow_to(weight->offs + n_size);
+                }
+                auto & mmap_used = mmaps_used[weight->idx];
+                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
                 if (lmlocks) {
                     const auto & lmlock = lmlocks->at(weight->idx);

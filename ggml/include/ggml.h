@@ -661,6 +661,9 @@ extern "C" {
         enum ggml_type type;
 
         struct ggml_backend_buffer * buffer;
+        // non-null only for main weight tensors with concrete allocated memory
+        // stores a copy of the backend buffer handle associated with this tensor
+        struct ggml_backend_buffer * weight_buffer;
 
         int64_t ne[GGML_MAX_DIMS]; // number of elements
         size_t  nb[GGML_MAX_DIMS]; // stride in bytes:
@@ -688,7 +691,7 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        char padding[16];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

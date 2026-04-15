@@ -1131,6 +1131,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
+        t_ij->weight_buffer = nullptr;
         t_ij->view_src = tensor->view_src;
         t_ij->view_offs = tensor->view_offs;
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
@@ -1377,6 +1378,7 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         t->buffer = meta_buf;
+        t->weight_buffer = nullptr;
         ggml_backend_meta_buffer_init_tensor(meta_buf, t);
         t->data = (void *) 0x2000000000000000; // FIXME
     }
@@ -1779,10 +1781,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // Tmp tensors to receive P2P copies
                 ggml_tensor * node_tmp_1 = get_node_aux(node1);
                 node_tmp_1->buffer = bcj1.buf.get();
+                node_tmp_1->weight_buffer = nullptr;
                 node_tmp_1->data = ggml_backend_buffer_get_base(bcj1.buf.get());
 
                 ggml_tensor * node_tmp_2 = get_node_aux(node2);
                 node_tmp_2->buffer = bcj2.buf.get();
+                node_tmp_2->weight_buffer = nullptr;
                 node_tmp_2->data = ggml_backend_buffer_get_base(bcj2.buf.get());
 
                 // 2 P2P copies: exchange full buffers
@@ -1920,4 +1924,3 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
 }
-

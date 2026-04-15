@@ -1755,6 +1755,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     *result = (struct ggml_tensor) {
         /*.type         =*/ type,
         /*.buffer       =*/ NULL,
+        /*.weight_buffer=*/ NULL,
         /*.ne           =*/ { 1, 1, 1, 1 },
         /*.nb           =*/ { 0, 0, 0, 0 },
         /*.op           =*/ GGML_OP_NONE,
