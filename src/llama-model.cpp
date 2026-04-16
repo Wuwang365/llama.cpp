@@ -29,6 +29,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -648,6 +649,15 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    // lazy weight loading state
+    std::mutex lazy_load_mutex;
+    bool lazy_load_done   = false;
+    bool lazy_load_failed = false;
+    std::string lazy_load_error;
+    std::unique_ptr<llama_model_loader> lazy_loader;
+    std::vector<std::pair<ggml_context *, ggml_backend_buffer_type_t>> lazy_ctx_buft;
+    std::vector<std::pair<ggml_context *, llama_buf_map>> lazy_ctx_buf_maps;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -2942,13 +2952,10 @@ void llama_model::load_vocab(llama_model_loader & ml) {
 
 bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
-    const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
-
-    const bool use_mmap_buffer = true;
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
@@ -8102,10 +8109,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
-    pimpl->mappings.reserve(ml.mappings.size());
+    const bool lazy_load = !ml.no_alloc;
 
-    // create the backend buffers
+    // create placeholder backend buffers: tensor metadata is initialized here, concrete
+    // allocation + weight loading is deferred to the first inference call.
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
 
@@ -8113,6 +8120,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // In strict per-tensor mode this is close to the number of tensors.
     const size_t n_max_backend_buffer = std::max<size_t>(ml.n_tensors, ml.ctx_map.size() * std::max<size_t>(1, ml.files.size()));
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+    pimpl->lazy_ctx_buft.reserve(ml.ctx_map.size());
 
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
@@ -8125,37 +8133,159 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         llama_buf_map buf_map;
         buf_map.reserve(n_max_backend_buffer);
 
-        // check if it is possible to use buffer_from_host_ptr with this buffer type
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            // FIXME: workaround for CPU backend buft having a NULL device
-            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (!dev) {
-                throw std::runtime_error(format("%s: no CPU backend found", __func__));
-            }
-        }
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
-        bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
-
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.no_alloc) {
-            // Keep the existing no_alloc behavior: dummy shared buffer, no concrete allocation.
-            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
-            if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("unable to allocate %s placeholder buffer", ggml_backend_buft_name(buft)));
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            t->buffer        = buf;
+            t->weight_buffer = nullptr;
+            t->data          = nullptr;
+        }
+
+        bufs.emplace_back(buf);
+
+        for (uint32_t idx = 0; idx < ml.files.size(); ++idx) {
+            buf_map.emplace(idx, buf);
+        }
+
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+        pimpl->lazy_ctx_buft.emplace_back(ctx, buft);
+        ctx_buf_maps.emplace_back(ctx, std::move(buf_map));
+    }
+
+    if (llama_supports_gpu_offload()) {
+        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
+
+        int n_repeating = n_gpu;
+        if (n_repeating > 0) {
+            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
+            n_repeating--;
+        }
+        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
+
+        const int max_backend_supported_layers = hparams.n_layer + 1;
+        const int max_offloadable_layers       = hparams.n_layer + 1;
+
+        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+    }
+
+    // print memory requirements per buffer type
+    std::map<std::string, size_t> model_buf_size_by_name;
+    for (auto & [_, bufs] : pimpl->ctxs_bufs) {
+        for (auto & buf: bufs) {
+            model_buf_size_by_name[ggml_backend_buffer_name(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+    }
+    for (const auto & [name, size] : model_buf_size_by_name) {
+        LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
+            __func__, name.c_str(), size / 1024.0 / 1024.0);
+    }
+
+    if (ml.no_alloc) {
+        return true;
+    }
+
+    if (lazy_load) {
+        pimpl->lazy_ctx_buf_maps = std::move(ctx_buf_maps);
+        pimpl->lazy_loader.reset(new llama_model_loader(std::move(ml)));
+        pimpl->lazy_load_done   = false;
+        pimpl->lazy_load_failed = false;
+        pimpl->lazy_load_error.clear();
+        LLAMA_LOG_INFO("%s: deferring weight allocation/load until first inference\n", __func__);
+        return true;
+    }
+
+    return true;
+}
+
+bool llama_model::ensure_tensors_ready(std::string & err_msg) {
+    err_msg.clear();
+
+    if (hparams.vocab_only || hparams.no_alloc) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl->lazy_load_mutex);
+
+    if (pimpl->lazy_load_done) {
+        return true;
+    }
+
+    if (pimpl->lazy_load_failed) {
+        err_msg = pimpl->lazy_load_error;
+        return false;
+    }
+
+    if (!pimpl->lazy_loader) {
+        pimpl->lazy_load_done = true;
+        return true;
+    }
+
+    try {
+        llama_model_loader & ml = *pimpl->lazy_loader;
+        const bool use_mmap_buffer = true;
+        const bool use_mlock       = params.use_mlock;
+
+        ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+        pimpl->mappings.clear();
+        pimpl->mappings.reserve(ml.mappings.size());
+        pimpl->mlock_bufs.clear();
+
+        std::unordered_map<ggml_context *, ggml_backend_buffer_type_t> ctx_buft_by_ptr;
+        ctx_buft_by_ptr.reserve(pimpl->lazy_ctx_buft.size());
+        for (const auto & [ctx, buft] : pimpl->lazy_ctx_buft) {
+            ctx_buft_by_ptr.emplace(ctx, buft);
+        }
+
+        std::unordered_map<ggml_context *, llama_buf_map *> ctx_buf_map_by_ptr;
+        ctx_buf_map_by_ptr.reserve(pimpl->lazy_ctx_buf_maps.size());
+        for (auto & [ctx, buf_map] : pimpl->lazy_ctx_buf_maps) {
+            ctx_buf_map_by_ptr.emplace(ctx, &buf_map);
+        }
+
+        for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
+            ggml_context * ctx = ctx_ptr.get();
+            if (ggml_get_first_tensor(ctx) == nullptr) {
+                continue;
             }
-            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            auto it_buft = ctx_buft_by_ptr.find(ctx);
+            if (it_buft == ctx_buft_by_ptr.end()) {
+                throw std::runtime_error("internal error: missing buffer type for model context");
+            }
+            ggml_backend_buffer_type_t buft = it_buft->second;
+
+            auto it_buf_map = ctx_buf_map_by_ptr.find(ctx);
+            if (it_buf_map == ctx_buf_map_by_ptr.end()) {
+                throw std::runtime_error("internal error: missing source buffer map for model context");
+            }
+            llama_buf_map & buf_map = *it_buf_map->second;
+            buf_map.clear();
+
+            // release placeholder buffers, then reset tensor pointers for re-allocation.
+            bufs.clear();
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                t->buffer        = nullptr;
                 t->weight_buffer = nullptr;
+                t->data          = nullptr;
             }
-            bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev) {
+                // FIXME: workaround for CPU backend buft having a NULL device
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!dev) {
+                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                }
             }
-        } else {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            const bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+            const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
             const size_t max_tensor_size = ggml_get_max_tensor_size(ctx);
             const bool try_tensor_mmap = ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
 
@@ -8232,69 +8362,52 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     t->weight_buffer = nullptr;
                 }
             }
+
+            // Keep the explicit weight handle in sync for traversal/introspection.
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                t->weight_buffer = (t->view_src == nullptr &&
+                                    t->data != nullptr &&
+                                    t->buffer != nullptr &&
+                                    ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+                                       ? t->buffer
+                                       : nullptr;
+            }
         }
 
-        // Keep the explicit weight handle in sync for traversal/introspection.
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            t->weight_buffer = (t->view_src == nullptr &&
-                                t->data != nullptr &&
-                                t->buffer != nullptr &&
-                                ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
-                                   ? t->buffer
-                                   : nullptr;
+        // load tensor data
+        for (auto & [ctx, buf_map] : pimpl->lazy_ctx_buf_maps) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : nullptr, params.progress_callback, params.progress_callback_user_data)) {
+                throw std::runtime_error("weight loading cancelled by progress callback");
+            }
         }
 
-        pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
-
-        ctx_buf_maps.emplace_back(ctx, buf_map);
-    }
-
-    if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
-
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
-            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
+        if (use_mmap_buffer) {
+            for (auto & mapping : ml.mappings) {
+                pimpl->mappings.emplace_back(std::move(mapping));
+            }
         }
-        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
-        const int max_backend_supported_layers = hparams.n_layer + 1;
-        const int max_offloadable_layers       = hparams.n_layer + 1;
-
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
-    }
-
-    // print memory requirements per buffer type
-    std::map<std::string, size_t> model_buf_size_by_name;
-    for (auto & [_, bufs] : pimpl->ctxs_bufs) {
-        for (auto & buf: bufs) {
-            model_buf_size_by_name[ggml_backend_buffer_name(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        // verify that all model tensors point to concrete memory.
+        for (const auto & [ctx_ptr, _] : pimpl->ctxs_bufs) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+                const bool has_real_memory = t->buffer != nullptr && ggml_backend_buffer_get_size(t->buffer) > 0 && t->data != nullptr;
+                if (!has_real_memory) {
+                    throw std::runtime_error(format("tensor %s has no backing memory after lazy load", ggml_get_name(t)));
+                }
+            }
         }
-    }
-    for (const auto & [name, size] : model_buf_size_by_name) {
-        LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
-            __func__, name.c_str(), size / 1024.0 / 1024.0);
-    }
 
-    if (ml.no_alloc) {
+        pimpl->lazy_loader.reset();
+        pimpl->lazy_ctx_buft.clear();
+        pimpl->lazy_ctx_buf_maps.clear();
+        pimpl->lazy_load_done = true;
         return true;
+    } catch (const std::exception & e) {
+        pimpl->lazy_load_failed = true;
+        pimpl->lazy_load_error = e.what();
+        err_msg = pimpl->lazy_load_error;
+        return false;
     }
-
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
-    }
-
-    if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
-        }
-    }
-
-    return true;
 }
 
 std::string llama_model::arch_name() const {

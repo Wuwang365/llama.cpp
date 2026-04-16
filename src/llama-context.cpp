@@ -1248,6 +1248,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    {
+        std::string err_msg;
+        if (!const_cast<llama_model &>(model).ensure_tensors_ready(err_msg)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare model tensors: %s\n", __func__, err_msg.c_str());
+            return -3;
+        }
+    }
+
     const auto & hparams = model.hparams;
 
     const int64_t n_embd  = hparams.n_embd_inp();
@@ -1541,6 +1549,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    {
+        std::string err_msg;
+        if (!const_cast<llama_model &>(model).ensure_tensors_ready(err_msg)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare model tensors: %s\n", __func__, err_msg.c_str());
+            return -3;
+        }
     }
 
     const auto & vocab   = model.vocab;
