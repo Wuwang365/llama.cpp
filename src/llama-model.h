@@ -589,6 +589,8 @@ struct llama_model {
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
     bool ensure_tensors_ready(std::string & err_msg);
+    bool unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed = nullptr);
+    bool is_tensor_loaded(const char * name) const;
 
     std::string arch_name() const;
     std::string type_name() const;

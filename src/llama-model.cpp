@@ -31,10 +31,12 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -630,7 +632,7 @@ struct llama_model::impl {
     llama_mmaps mappings;
 
     // objects representing data potentially being locked in memory
-    llama_mlocks mlock_bufs;
+    std::unordered_map<ggml_backend_buffer_t, std::unique_ptr<llama_mlock>> mlock_bufs;
     llama_mlocks mlock_mmaps;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
@@ -659,6 +661,48 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context *, ggml_backend_buffer_type_t>> lazy_ctx_buft;
     std::vector<std::pair<ggml_context *, llama_buf_map>> lazy_ctx_buf_maps;
 };
+
+static bool llama_tensor_has_backing_memory(const ggml_tensor * t) {
+    return t->buffer != nullptr && t->data != nullptr && ggml_backend_buffer_get_size(t->buffer) > 0;
+}
+
+static bool llama_tensor_depends_on(const ggml_tensor * t, const ggml_tensor * root) {
+    for (const ggml_tensor * cur = t; cur != nullptr; cur = cur->view_src) {
+        if (cur == root) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct llama_tensor_location {
+    ggml_context * ctx = nullptr;
+    std::vector<ggml_backend_buffer_ptr> * bufs = nullptr;
+};
+
+static std::optional<llama_tensor_location> llama_find_tensor_location(
+        std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs,
+        ggml_tensor * target) {
+    for (auto & [ctx_ptr, bufs] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+            if (t == target) {
+                return llama_tensor_location{ctx_ptr.get(), &bufs};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+static ggml_backend_dev_t llama_get_buft_device_or_cpu(ggml_backend_buffer_type_t buft, const char * func) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!dev) {
+            throw std::runtime_error(format("%s: no CPU backend found", func));
+        }
+    }
+    return dev;
+}
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
@@ -8202,6 +8246,159 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+static void llama_refresh_tensor_views(ggml_context * ctx) {
+    bool changed = false;
+    do {
+        changed = false;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr && t->buffer == nullptr && t->view_src->buffer != nullptr && t->view_src->data != nullptr) {
+                if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error(format("failed to initialize tensor view %s", ggml_get_name(t)));
+                }
+                t->weight_buffer = nullptr;
+                changed = true;
+            }
+        }
+    } while (changed);
+}
+
+static void llama_refresh_weight_handles(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        t->weight_buffer = (t->view_src == nullptr &&
+                            t->data != nullptr &&
+                            t->buffer != nullptr &&
+                            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
+                               ? t->buffer
+                               : nullptr;
+    }
+}
+
+static void llama_ensure_tensor_allocated(
+        llama_model_loader & ml,
+        bool use_mlock,
+        llama_mlocks & mlock_mmaps,
+        std::unordered_map<ggml_backend_buffer_t, std::unique_ptr<llama_mlock>> & mlock_bufs,
+        ggml_context * ctx,
+        ggml_backend_buffer_type_t buft,
+        llama_buf_map * buf_map,
+        std::vector<ggml_backend_buffer_ptr> & bufs,
+        ggml_tensor * t) {
+    const bool use_mmap_buffer = true;
+    const auto * weight        = ml.get_weight(ggml_get_name(t));
+    const size_t alloc_size    = ggml_backend_buft_get_alloc_size(buft, t);
+    const size_t max_tensor_size = ggml_get_max_tensor_size(ctx);
+    ggml_backend_dev_t dev = llama_get_buft_device_or_cpu(buft, __func__);
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    const bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+    const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+    const bool try_tensor_mmap = ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
+
+    ggml_backend_buffer_t buf = nullptr;
+
+    if (try_tensor_mmap && weight != nullptr && alloc_size == ggml_nbytes(t)) {
+        const auto & mapping = ml.mappings.at(weight->idx);
+        uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+        buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, alloc_size, max_tensor_size);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("unable to allocate mmap-backed %s tensor buffer for %s",
+                ggml_backend_buft_name(buft), ggml_get_name(t)));
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        const enum ggml_status status = ggml_backend_tensor_alloc(buf, t, data);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            throw std::runtime_error(format("failed to initialize mmap-backed tensor %s", ggml_get_name(t)));
+        }
+
+        if (use_mlock) {
+            const auto & lmlock = mlock_mmaps.at(weight->idx);
+            lmlock->grow_to(weight->offs + ggml_nbytes(t));
+        }
+        auto & mmap_used = ml.mmaps_used[weight->idx];
+        mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+        mmap_used.second = std::max(mmap_used.second, weight->offs + ggml_nbytes(t));
+    } else {
+        buf = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("unable to allocate %s tensor buffer for %s",
+                ggml_backend_buft_name(buft), ggml_get_name(t)));
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        void * base = ggml_backend_buffer_get_base(buf);
+        const enum ggml_status status = ggml_backend_tensor_alloc(buf, t, base);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            throw std::runtime_error(format("failed to initialize tensor %s", ggml_get_name(t)));
+        }
+
+        if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+            std::unique_ptr<llama_mlock> mlock_buf(new llama_mlock);
+            mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+            mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+            mlock_bufs.emplace(buf, std::move(mlock_buf));
+        }
+    }
+
+    if (weight != nullptr && buf_map != nullptr) {
+        buf_map->try_emplace(weight->idx, buf);
+    }
+
+    bufs.emplace_back(buf);
+}
+
+static void llama_load_tensor_data(
+        llama_model_loader & ml,
+        bool use_mlock,
+        llama_mlocks & mlock_mmaps,
+        ggml_tensor * t) {
+    const auto * weight = ml.get_weight(ggml_get_name(t));
+    if (weight == nullptr) {
+        return;
+    }
+
+    if (ml.files.empty()) {
+        ml.set_tensor_data(t, ml.set_tensor_data_ud);
+        return;
+    }
+
+    const size_t n_size = ggml_nbytes(t);
+
+    if (ml.use_mmap) {
+        const auto & mapping = ml.mappings.at(weight->idx);
+        uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+
+        if (t->data == data) {
+            if (use_mlock) {
+                const auto & lmlock = mlock_mmaps.at(weight->idx);
+                lmlock->grow_to(weight->offs + n_size);
+            }
+            auto & mmap_used = ml.mmaps_used[weight->idx];
+            mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+            mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            return;
+        }
+
+        ggml_backend_tensor_set(t, data, 0, n_size);
+
+        if (use_mlock) {
+            const auto & lmlock = mlock_mmaps.at(weight->idx);
+            lmlock->grow_to(weight->offs + n_size);
+        }
+        auto & mmap_used = ml.mmaps_used[weight->idx];
+        mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+        mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+        return;
+    }
+
+    std::vector<no_init<uint8_t>> read_buf(n_size);
+    auto & file = ml.files.at(weight->idx);
+    file->seek(weight->offs, SEEK_SET);
+    file->read_raw(read_buf.data(), n_size);
+    ggml_backend_tensor_set(t, read_buf.data(), 0, n_size);
+}
+
 bool llama_model::ensure_tensors_ready(std::string & err_msg) {
     err_msg.clear();
 
@@ -8212,7 +8409,47 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
     std::lock_guard<std::mutex> lock(pimpl->lazy_load_mutex);
 
     if (pimpl->lazy_load_done) {
-        return true;
+        if (!pimpl->lazy_loader) {
+            return true;
+        }
+
+        try {
+            llama_model_loader & ml = *pimpl->lazy_loader;
+            ml.init_mappings(true, params.use_mlock ? &pimpl->mlock_mmaps : nullptr);
+
+            std::unordered_map<ggml_context *, ggml_backend_buffer_type_t> ctx_buft_by_ptr;
+            ctx_buft_by_ptr.reserve(pimpl->lazy_ctx_buft.size());
+            for (const auto & [ctx, buft] : pimpl->lazy_ctx_buft) {
+                ctx_buft_by_ptr.emplace(ctx, buft);
+            }
+
+            for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
+                ggml_context * ctx = ctx_ptr.get();
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->view_src != nullptr || llama_tensor_has_backing_memory(t)) {
+                        continue;
+                    }
+
+                    auto it_buft = ctx_buft_by_ptr.find(ctx);
+                    if (it_buft == ctx_buft_by_ptr.end()) {
+                        throw std::runtime_error("internal error: missing buffer type for model context");
+                    }
+
+                    llama_ensure_tensor_allocated(ml, params.use_mlock, pimpl->mlock_mmaps, pimpl->mlock_bufs, ctx, it_buft->second, nullptr, bufs, t);
+                    llama_load_tensor_data(ml, params.use_mlock, pimpl->mlock_mmaps, t);
+                }
+
+                llama_refresh_tensor_views(ctx);
+                llama_refresh_weight_handles(ctx);
+            }
+
+            return true;
+        } catch (const std::exception & e) {
+            pimpl->lazy_load_failed = true;
+            pimpl->lazy_load_error = e.what();
+            err_msg = pimpl->lazy_load_error;
+            return false;
+        }
     }
 
     if (pimpl->lazy_load_failed) {
@@ -8227,7 +8464,6 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
 
     try {
         llama_model_loader & ml = *pimpl->lazy_loader;
-        const bool use_mmap_buffer = true;
         const bool use_mlock       = params.use_mlock;
 
         ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
@@ -8274,116 +8510,26 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
                 t->data          = nullptr;
             }
 
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            if (!dev) {
-                // FIXME: workaround for CPU backend buft having a NULL device
-                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                if (!dev) {
-                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
-                }
-            }
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev, &props);
-            const bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
-            const bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
-            const size_t max_tensor_size = ggml_get_max_tensor_size(ctx);
-            const bool try_tensor_mmap = ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
-
             // 1) Allocate main tensors: strict 1:1 (one backend buffer per main tensor).
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 if (t->view_src != nullptr || t->buffer != nullptr || t->data != nullptr) {
                     continue;
                 }
 
-                const auto * weight = ml.get_weight(ggml_get_name(t));
-                const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-                ggml_backend_buffer_t buf = nullptr;
-
-                // Use direct mmap-backed tensor buffer only when size semantics match.
-                if (try_tensor_mmap && weight != nullptr && alloc_size == ggml_nbytes(t)) {
-                    const auto & mapping = ml.mappings.at(weight->idx);
-                    uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
-                    buf = ggml_backend_dev_buffer_from_host_ptr(dev, data, alloc_size, max_tensor_size);
-                    if (buf == nullptr) {
-                        throw std::runtime_error(format("unable to allocate mmap-backed %s tensor buffer for %s",
-                            ggml_backend_buft_name(buft), ggml_get_name(t)));
-                    }
-                    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                    const enum ggml_status status = ggml_backend_tensor_alloc(buf, t, data);
-                    if (status != GGML_STATUS_SUCCESS) {
-                        ggml_backend_buffer_free(buf);
-                        throw std::runtime_error(format("failed to initialize mmap-backed tensor %s", ggml_get_name(t)));
-                    }
-
-                    if (use_mlock) {
-                        const auto & lmlock = pimpl->mlock_mmaps.at(weight->idx);
-                        lmlock->grow_to(weight->offs + ggml_nbytes(t));
-                    }
-                    auto & mmap_used = ml.mmaps_used[weight->idx];
-                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                    mmap_used.second = std::max(mmap_used.second, weight->offs + ggml_nbytes(t));
-                } else {
-                    buf = ggml_backend_buft_alloc_buffer(buft, alloc_size);
-                    if (buf == nullptr) {
-                        throw std::runtime_error(format("unable to allocate %s tensor buffer for %s",
-                            ggml_backend_buft_name(buft), ggml_get_name(t)));
-                    }
-                    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-                    void * base = ggml_backend_buffer_get_base(buf);
-                    const enum ggml_status status = ggml_backend_tensor_alloc(buf, t, base);
-                    if (status != GGML_STATUS_SUCCESS) {
-                        ggml_backend_buffer_free(buf);
-                        throw std::runtime_error(format("failed to initialize tensor %s", ggml_get_name(t)));
-                    }
-
-                    if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-                        pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                        auto & mlock_buf = pimpl->mlock_bufs.back();
-                        mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-                        mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
-                    }
-                }
-
-                if (weight != nullptr) {
-                    // keep one representative buffer per source file for async upload capability detection
-                    buf_map.try_emplace(weight->idx, buf);
-                }
-
-                bufs.emplace_back(buf);
+                llama_ensure_tensor_allocated(ml, use_mlock, pimpl->mlock_mmaps, pimpl->mlock_bufs, ctx, buft, &buf_map, bufs, t);
             }
 
             // 2) Initialize views after their source tensors are allocated.
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                if (t->view_src != nullptr && t->buffer == nullptr) {
-                    if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
-                        throw std::runtime_error(format("failed to initialize tensor view %s", ggml_get_name(t)));
-                    }
-                    t->weight_buffer = nullptr;
-                }
-            }
+            llama_refresh_tensor_views(ctx);
 
             // Keep the explicit weight handle in sync for traversal/introspection.
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                t->weight_buffer = (t->view_src == nullptr &&
-                                    t->data != nullptr &&
-                                    t->buffer != nullptr &&
-                                    ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)
-                                       ? t->buffer
-                                       : nullptr;
-            }
+            llama_refresh_weight_handles(ctx);
         }
 
         // load tensor data
         for (auto & [ctx, buf_map] : pimpl->lazy_ctx_buf_maps) {
             if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : nullptr, params.progress_callback, params.progress_callback_user_data)) {
                 throw std::runtime_error("weight loading cancelled by progress callback");
-            }
-        }
-
-        if (use_mmap_buffer) {
-            for (auto & mapping : ml.mappings) {
-                pimpl->mappings.emplace_back(std::move(mapping));
             }
         }
 
@@ -8397,9 +8543,6 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
             }
         }
 
-        pimpl->lazy_loader.reset();
-        pimpl->lazy_ctx_buft.clear();
-        pimpl->lazy_ctx_buf_maps.clear();
         pimpl->lazy_load_done = true;
         return true;
     } catch (const std::exception & e) {
@@ -8742,6 +8885,73 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+bool llama_model::is_tensor_loaded(const char * name) const {
+    const ggml_tensor * tensor = get_tensor(name);
+    return tensor != nullptr && tensor->view_src == nullptr && llama_tensor_has_backing_memory(tensor);
+}
+
+bool llama_model::unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed) {
+    err_msg.clear();
+    if (bytes_freed != nullptr) {
+        *bytes_freed = 0;
+    }
+
+    if (hparams.vocab_only || hparams.no_alloc) {
+        err_msg = "model weights are not allocated";
+        return false;
+    }
+
+    ggml_tensor * tensor = const_cast<ggml_tensor *>(get_tensor(name));
+    if (tensor == nullptr) {
+        err_msg = format("tensor '%s' not found", name);
+        return false;
+    }
+
+    if (tensor->view_src != nullptr) {
+        err_msg = format("tensor '%s' is a view and cannot be unloaded independently", name);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl->lazy_load_mutex);
+
+    if (!llama_tensor_has_backing_memory(tensor)) {
+        err_msg = format("tensor '%s' is already unloaded", name);
+        return false;
+    }
+
+    auto loc = llama_find_tensor_location(pimpl->ctxs_bufs, tensor);
+    if (!loc.has_value()) {
+        err_msg = format("internal error: tensor '%s' was not found in model contexts", name);
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = tensor->buffer;
+    const size_t freed = ggml_backend_buffer_get_size(buf);
+
+    for (ggml_tensor * t = ggml_get_first_tensor(loc->ctx); t != nullptr; t = ggml_get_next_tensor(loc->ctx, t)) {
+        if (!llama_tensor_depends_on(t, tensor)) {
+            continue;
+        }
+        t->buffer = nullptr;
+        t->weight_buffer = nullptr;
+        t->data = nullptr;
+    }
+
+    pimpl->mlock_bufs.erase(buf);
+
+    auto & bufs = *loc->bufs;
+    bufs.erase(std::remove_if(bufs.begin(), bufs.end(),
+        [buf](const ggml_backend_buffer_ptr & cur) {
+            return cur.get() == buf;
+        }), bufs.end());
+
+    if (bytes_freed != nullptr) {
+        *bytes_freed = freed;
+    }
+
+    return true;
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

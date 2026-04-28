@@ -1326,7 +1326,7 @@ void llama_model_loader::done_getting_tensors() const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
-    if (use_mmap) {
+    if (use_mmap && mappings.empty()) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (const auto & file : files) {
@@ -1353,8 +1353,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 
     // compute the total size of all tensors for progress reporting
-    for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+    if (size_data == 0) {
+        for (const auto & it : weights_map) {
+            size_data += ggml_nbytes(it.second.tensor);
+        }
     }
 }
 

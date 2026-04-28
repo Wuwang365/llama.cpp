@@ -5,7 +5,9 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
+#include "../../src/llama-model.h"
 
+#include <algorithm>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +43,70 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+static std::string format_bytes(size_t bytes) {
+    const char * units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double value = bytes;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < sizeof(units)/sizeof(units[0])) {
+        value /= 1024.0;
+        ++unit;
+    }
+    return string_format(unit == 0 ? "%.0f %s" : "%.2f %s", value, units[unit]);
+}
+
+static std::string format_shape(const ggml_tensor * tensor) {
+    std::ostringstream ss;
+    ss << "[";
+    for (int i = ggml_n_dims(tensor) - 1; i >= 0; --i) {
+        if (i != ggml_n_dims(tensor) - 1) {
+            ss << " x ";
+        }
+        ss << tensor->ne[i];
+    }
+    ss << "]";
+    return ss.str();
+}
+
+static bool handle_model_command(llama_model * model, const std::string & input) {
+    if (input == "/list_weight") {
+        LOG("\n");
+        for (const auto & [name, tensor] : llama_internal_get_tensor_map(model)) {
+            if (tensor->view_src != nullptr) {
+                continue;
+            }
+
+            const bool loaded = model->is_tensor_loaded(name.c_str());
+            const size_t resident = loaded ? ggml_backend_buffer_get_size(tensor->buffer) : 0;
+            LOG("%-48s  %10s  %-18s  %s\n",
+                name.c_str(),
+                format_bytes(resident).c_str(),
+                format_shape(tensor).c_str(),
+                loaded ? "loaded" : "unloaded");
+        }
+        LOG("\n");
+        return true;
+    }
+
+    if (input.rfind("/unload ", 0) == 0) {
+        const std::string tensor_name = string_strip(input.substr(std::strlen("/unload ")));
+        if (tensor_name.empty()) {
+            LOG("usage: /unload <layer_name>\n");
+            return true;
+        }
+
+        size_t bytes_freed = 0;
+        std::string err_msg;
+        if (model->unload_tensor(tensor_name.c_str(), err_msg, &bytes_freed)) {
+            LOG("unloaded %s, freed %s\n", tensor_name.c_str(), format_bytes(bytes_freed).c_str());
+        } else {
+            LOG("%s\n", err_msg.c_str());
+        }
+        return true;
+    }
+
+    return false;
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -538,6 +604,9 @@ int main(int argc, char ** argv) {
         if (params.conversation_mode && params.enable_chat_template && params.system_prompt.empty()) {
             LOG_INF(   " - Not using system message. To change it, set a different value via -sys PROMPT\n");
         }
+        if (params.conversation_mode) {
+            LOG_INF(   " - Commands: /list_weight, /unload <layer_name>\n");
+        }
         LOG_INF("\n");
 
         is_interacting = params.interactive_first;
@@ -892,6 +961,10 @@ int main(int argc, char ** argv) {
                     // this should be accomplished by explicitly adding a newline by using \ followed by return,
                     // then returning control by pressing return again.
                     buffer.pop_back();
+                }
+
+                if (params.conversation_mode && handle_model_command(model, buffer)) {
+                    continue;
                 }
 
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
