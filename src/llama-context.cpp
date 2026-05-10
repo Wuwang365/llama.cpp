@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <stdexcept>
 
 //
@@ -2638,6 +2639,8 @@ llama_perf_context_data llama_context::perf_get_data() const {
 
     data.t_start_ms  = 1e-3 * t_start_us;
     data.t_load_ms   = 1e-3 * t_load_us;
+    data.n_load_bytes = model.size();
+    data.load_io_bytes_per_second = t_load_us > 0 ? 1e6 * double(data.n_load_bytes) / double(t_load_us) : 0.0;
     data.t_p_eval_ms = 1e-3 * t_p_eval_us;
     data.t_eval_ms   = 1e-3 * t_eval_us;
     data.n_p_eval    = std::max(1, n_p_eval);
@@ -2645,6 +2648,19 @@ llama_perf_context_data llama_context::perf_get_data() const {
     data.n_reused    = std::max(0, n_reused);
 
     return data;
+}
+
+static std::string llama_format_bytes_per_second(double bytes_per_second) {
+    const char * units[] = {"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"};
+    double value = bytes_per_second;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < sizeof(units)/sizeof(units[0])) {
+        value /= 1024.0;
+        ++unit;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), unit == 0 ? "%.0f %s" : "%.2f %s", value, units[unit]);
+    return buf;
 }
 
 void llama_context::perf_reset() {
@@ -3499,6 +3515,8 @@ void llama_perf_context_print(const llama_context * ctx) {
     const double t_end_ms = 1e-3 * ggml_time_us();
 
     LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
+    LLAMA_LOG_INFO("%s:  load IO speed = %10s / %8.2f MiB\n",
+            __func__, llama_format_bytes_per_second(data.load_io_bytes_per_second).c_str(), data.n_load_bytes / 1024.0 / 1024.0);
     LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",

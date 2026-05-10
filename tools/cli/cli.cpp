@@ -2,6 +2,7 @@
 #include "common.h"
 #include "arg.h"
 #include "console.h"
+#include "../../src/llama-model.h"
 // #include "log.h"
 
 #include "server-context.h"
@@ -10,8 +11,10 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <thread>
 #include <signal.h>
 
@@ -224,14 +227,91 @@ struct cli_context {
 };
 
 // TODO?: Make this reusable, enums, docs
-static const std::array<const std::string, 7> cmds = {
+static std::string format_bytes(size_t bytes) {
+    const char * units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double value = bytes;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < sizeof(units)/sizeof(units[0])) {
+        value /= 1024.0;
+        ++unit;
+    }
+    return string_format(unit == 0 ? "%.0f %s" : "%.2f %s", value, units[unit]);
+}
+
+static std::string format_bytes_per_second(double bytes_per_second) {
+    const char * units[] = {"B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"};
+    double value = bytes_per_second;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < sizeof(units)/sizeof(units[0])) {
+        value /= 1024.0;
+        ++unit;
+    }
+    return string_format(unit == 0 ? "%.0f %s" : "%.2f %s", value, units[unit]);
+}
+
+static std::string format_shape(const ggml_tensor * tensor) {
+    std::ostringstream ss;
+    ss << "[";
+    for (int i = ggml_n_dims(tensor) - 1; i >= 0; --i) {
+        if (i != ggml_n_dims(tensor) - 1) {
+            ss << " x ";
+        }
+        ss << tensor->ne[i];
+    }
+    ss << "]";
+    return ss.str();
+}
+
+static bool handle_model_command(llama_model * model, const std::string & input) {
+    if (input == "/list_weight") {
+        console::log("\n");
+        for (const auto & [name, tensor] : llama_internal_get_tensor_map(model)) {
+            if (tensor->view_src != nullptr) {
+                continue;
+            }
+
+            const bool loaded = model->is_tensor_loaded(name.c_str());
+            const size_t resident = loaded ? ggml_backend_buffer_get_size(tensor->buffer) : 0;
+            console::log("%-48s  %10s  %-18s  %s\n",
+                name.c_str(),
+                format_bytes(resident).c_str(),
+                format_shape(tensor).c_str(),
+                loaded ? "loaded" : "unloaded");
+        }
+        console::log("\n");
+        return true;
+    }
+
+    if (string_starts_with(input, "/unload ")) {
+        const std::string tensor_name = string_strip(input.substr(std::strlen("/unload ")));
+        if (tensor_name.empty()) {
+            console::log("usage: /unload <layer_name>\n");
+            return true;
+        }
+
+        size_t bytes_freed = 0;
+        std::string err_msg;
+        if (model->unload_tensor(tensor_name.c_str(), err_msg, &bytes_freed)) {
+            console::log("unloaded %s, freed %s\n", tensor_name.c_str(), format_bytes(bytes_freed).c_str());
+        } else {
+            console::log("%s\n", err_msg.c_str());
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static const std::array<const std::string, 9> cmds = {
     "/audio ",
     "/clear",
     "/exit",
     "/glob ",
     "/image ",
+    "/list_weight",
     "/read ",
     "/regen",
+    "/unload ",
 };
 
 static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std::string_view line, size_t cursor_byte_pos) {
@@ -397,6 +477,13 @@ int main(int argc, char ** argv) {
     console::spinner::stop();
     console::log("\n");
 
+    {
+        const llama_perf_context_data perf = llama_perf_context(ctx_cli.ctx_server.get_llama_context());
+        console::log("load IO speed : %s / %s\n",
+            format_bytes_per_second(perf.load_io_bytes_per_second).c_str(),
+            format_bytes(perf.n_load_bytes).c_str());
+    }
+
     std::thread inference_thread([&ctx_cli]() {
         ctx_cli.ctx_server.start_loop();
     });
@@ -435,6 +522,8 @@ int main(int argc, char ** argv) {
     console::log("  /clear              clear the chat history\n");
     console::log("  /read <file>        add a text file\n");
     console::log("  /glob <pattern>     add text files using globbing pattern\n");
+    console::log("  /list_weight        list model weights and resident memory\n");
+    console::log("  /unload <layer>     unload a model weight tensor\n");
     if (inf.has_inp_image) {
         console::log("  /image <file>       add an image file\n");
     }
@@ -534,6 +623,8 @@ int main(int argc, char ** argv) {
 
             ctx_cli.input_files.clear();
             console::log("Chat history cleared.\n");
+            continue;
+        } else if (handle_model_command(const_cast<llama_model *>(llama_get_model(ctx_cli.ctx_server.get_llama_context())), buffer)) {
             continue;
         } else if (
                 (string_starts_with(buffer, "/image ") && inf.has_inp_image) ||

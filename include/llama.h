@@ -1524,8 +1524,11 @@ extern "C" {
         // ms == milliseconds
         double t_start_ms;  // absolute start time
         double t_load_ms;   // time needed for loading the model
+        double load_io_bytes_per_second; // model bytes divided by load time
         double t_p_eval_ms; // time needed for processing the prompt
         double t_eval_ms;   // time needed for generating tokens
+
+        uint64_t n_load_bytes; // model bytes used for load IO speed estimate
 
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens
