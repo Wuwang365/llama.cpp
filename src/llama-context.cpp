@@ -364,6 +364,8 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    const_cast<llama_model &>(model).start_async_tensors_load();
 }
 
 llama_context::~llama_context() {

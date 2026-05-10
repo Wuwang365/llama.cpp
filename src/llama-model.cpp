@@ -36,6 +36,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -656,7 +657,9 @@ struct llama_model::impl {
     std::mutex lazy_load_mutex;
     bool lazy_load_done   = false;
     bool lazy_load_failed = false;
+    bool lazy_load_async_started = false;
     std::string lazy_load_error;
+    std::thread lazy_load_thread;
     std::unique_ptr<llama_model_loader> lazy_loader;
     std::vector<std::pair<ggml_context *, ggml_backend_buffer_type_t>> lazy_ctx_buft;
     std::vector<std::pair<ggml_context *, llama_buf_map>> lazy_ctx_buf_maps;
@@ -709,6 +712,8 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    wait_async_tensors_load();
+
     for (auto * lora : loras) {
         delete lora;
     }
@@ -8238,12 +8243,52 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         pimpl->lazy_loader.reset(new llama_model_loader(std::move(ml)));
         pimpl->lazy_load_done   = false;
         pimpl->lazy_load_failed = false;
+        pimpl->lazy_load_async_started = false;
         pimpl->lazy_load_error.clear();
-        LLAMA_LOG_INFO("%s: deferring weight allocation/load until first inference\n", __func__);
+        LLAMA_LOG_INFO("%s: deferring weight allocation/load%s\n", __func__,
+            params.parallel_load ? " until context init background preload" : " until first inference");
         return true;
     }
 
     return true;
+}
+
+void llama_model::start_async_tensors_load() {
+    if (!params.parallel_load || hparams.vocab_only || hparams.no_alloc) {
+        return;
+    }
+
+    bool start = false;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->lazy_load_mutex);
+        if (!pimpl->lazy_loader || pimpl->lazy_load_done || pimpl->lazy_load_failed || pimpl->lazy_load_async_started) {
+            return;
+        }
+        pimpl->lazy_load_async_started = true;
+        start = true;
+    }
+
+    if (!start) {
+        return;
+    }
+
+    pimpl->lazy_load_thread = std::thread([this] {
+        std::string err_msg;
+        if (!this->ensure_tensors_ready(err_msg)) {
+            LLAMA_LOG_ERROR("%s: async tensor loading failed: %s\n", __func__, err_msg.c_str());
+        }
+    });
+
+    LLAMA_LOG_INFO("%s: started background tensor loading\n", __func__);
+}
+
+void llama_model::wait_async_tensors_load() {
+    if (pimpl->lazy_load_thread.joinable()) {
+        if (pimpl->lazy_load_thread.get_id() == std::this_thread::get_id()) {
+            return;
+        }
+        pimpl->lazy_load_thread.join();
+    }
 }
 
 static void llama_refresh_tensor_views(ggml_context * ctx) {
@@ -8399,6 +8444,38 @@ static void llama_load_tensor_data(
     ggml_backend_tensor_set(t, read_buf.data(), 0, n_size);
 }
 
+static bool llama_load_all_tensor_data_per_tensor(
+        llama_model_loader & ml,
+        bool use_mlock,
+        llama_mlocks & mlock_mmaps,
+        const std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs,
+        llama_progress_callback progress_callback,
+        void * progress_callback_user_data) {
+    for (const auto & [ctx_ptr, _] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+            if (ml.get_weight(ggml_get_name(t)) == nullptr) {
+                continue;
+            }
+
+            if (progress_callback) {
+                const float progress = ml.size_data == 0 ? 0.0f : (float) ml.size_done / ml.size_data;
+                if (!progress_callback(progress, progress_callback_user_data)) {
+                    return false;
+                }
+            }
+
+            llama_load_tensor_data(ml, use_mlock, mlock_mmaps, t);
+            ml.size_done += ggml_nbytes(t);
+        }
+    }
+
+    if (progress_callback) {
+        return progress_callback(1.0f, progress_callback_user_data);
+    }
+
+    return true;
+}
+
 bool llama_model::ensure_tensors_ready(std::string & err_msg) {
     err_msg.clear();
 
@@ -8526,11 +8603,14 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
             llama_refresh_weight_handles(ctx);
         }
 
-        // load tensor data
-        for (auto & [ctx, buf_map] : pimpl->lazy_ctx_buf_maps) {
-            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : nullptr, params.progress_callback, params.progress_callback_user_data)) {
-                throw std::runtime_error("weight loading cancelled by progress callback");
-            }
+        if (!llama_load_all_tensor_data_per_tensor(
+                    ml,
+                    use_mlock,
+                    pimpl->mlock_mmaps,
+                    pimpl->ctxs_bufs,
+                    params.progress_callback,
+                    params.progress_callback_user_data)) {
+            throw std::runtime_error("weight loading cancelled by progress callback");
         }
 
         // verify that all model tensors point to concrete memory.
@@ -9672,6 +9752,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.parallel_load               =*/ false,
     };
 
     return result;

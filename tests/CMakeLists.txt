@@ -232,6 +232,8 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 llama_build_and_test(test-weight-unload.cpp LABEL "model" ARGS "${MODEL_DEST}")
 set_tests_properties(test-weight-unload PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-parallel-load.cpp LABEL "model" ARGS "${MODEL_DEST}")
+set_tests_properties(test-parallel-load PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
 
