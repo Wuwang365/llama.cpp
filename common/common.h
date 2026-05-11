@@ -536,6 +536,8 @@ struct common_params {
     bool use_direct_io     = false; // read from disk without buffering
     bool use_mlock         = false; // use mlock to keep model in memory
     bool parallel_load     = false; // preload model weights on a background thread after context init
+    bool async_io_load     = false; // use explicit async IO queues for non-mmap weight loading
+    bool load_micro_stats  = false; // print fine-grained weight loading timing statistics
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

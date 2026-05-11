@@ -135,6 +135,27 @@ struct llama_file::impl {
         }
     }
 
+    void read_raw_at(size_t offset, void * ptr, size_t len) {
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
+            DWORD chunk_read = 0;
+            OVERLAPPED overlapped{};
+            const uint64_t pos = offset + bytes_read;
+            overlapped.Offset     = (DWORD) (pos & 0xffffffff);
+            overlapped.OffsetHigh = (DWORD) (pos >> 32);
+            BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, &overlapped);
+            if (!result) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            if (chunk_read < chunk_size || chunk_read == 0) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+
+            bytes_read += chunk_read;
+        }
+    }
+
     uint32_t read_u32() {
         uint32_t val;
         read_raw(&val, sizeof(val));
@@ -310,6 +331,10 @@ struct llama_file::impl {
 
     void read_aligned_chunk(void * dest, size_t size) {
         size_t offset = tell();
+        read_aligned_chunk_at(offset, dest, size);
+    }
+
+    void read_aligned_chunk_at(size_t offset, void * dest, size_t size) {
         off_t aligned_offset = offset & ~(alignment - 1);
         off_t offset_from_alignment = offset - aligned_offset;
         size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
@@ -325,8 +350,7 @@ struct llama_file::impl {
         };
         std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
 
-        seek(aligned_offset, SEEK_SET);
-        read_raw_unsafe(buffer.get(), bytes_to_read);
+        read_raw_unsafe_at(aligned_offset, buffer.get(), bytes_to_read);
 
         uintptr_t actual_data = reinterpret_cast<uintptr_t>(buffer.get()) + offset_from_alignment;
         memcpy(dest, reinterpret_cast<void *>(actual_data), size);
@@ -338,6 +362,48 @@ struct llama_file::impl {
         } else {
             read_raw_unsafe(ptr, len);
         }
+    }
+
+    void read_raw_at(size_t offset, void * ptr, size_t len) {
+        if (has_direct_io()) {
+            read_aligned_chunk_at(offset, ptr, len);
+        } else {
+            read_raw_unsafe_at(offset, ptr, len);
+        }
+    }
+
+    void read_raw_unsafe_at(size_t offset, void * ptr, size_t len) {
+        if (len == 0) {
+            return;
+        }
+        errno = 0;
+
+        const int read_fd = fd == -1 ? file_id_from_fp() : fd;
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            const size_t to_read = len - bytes_read;
+            ssize_t ret = pread(read_fd, reinterpret_cast<char *>(ptr) + bytes_read, to_read, offset + bytes_read);
+
+            if (ret == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(format("read error: %s", strerror(errno)));
+            }
+            if (ret == 0) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+
+            bytes_read += (size_t) ret;
+        }
+    }
+
+    int file_id_from_fp() const {
+#if defined(fileno)
+        return fileno(fp);
+#else
+        return ::fileno(fp);
+#endif
     }
 
     uint32_t read_u32() {
@@ -407,16 +473,13 @@ int llama_file::file_id() const {
     if (pimpl->fd != -1) {
         return pimpl->fd;
     }
-#if defined(fileno)
-    return fileno(pimpl->fp);
-#else
-    return ::fileno(pimpl->fp);
-#endif
+    return pimpl->file_id_from_fp();
 #endif
 }
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file::read_raw_at(size_t offset, void * ptr, size_t len) { pimpl->read_raw_at(offset, ptr, len); }
 #ifdef _WIN32
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else

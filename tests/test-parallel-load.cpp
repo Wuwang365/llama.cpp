@@ -63,6 +63,8 @@ int main(int argc, char ** argv) {
     mparams.n_gpu_layers = 0;
     mparams.use_mmap = false;
     mparams.parallel_load = true;
+    mparams.async_io_load = true;
+    mparams.load_micro_stats = true;
     mparams.progress_callback = parallel_load_progress;
     mparams.progress_callback_user_data = &probe;
 

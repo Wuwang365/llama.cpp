@@ -320,6 +320,8 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool parallel_load;   // preload weights on a background thread after context init
+        bool async_io_load;   // use explicit asynchronous IO queues for non-mmap weight loading
+        bool load_micro_stats; // print fine-grained weight loading timing statistics
     };
 
     struct llama_sampler_seq_config {

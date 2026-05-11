@@ -1422,10 +1422,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;
     mparams.use_mlock       = params.use_mlock;
-    mparams.parallel_load   = params.parallel_load;
-    mparams.check_tensors   = params.check_tensors;
-    mparams.use_extra_bufts = !params.no_extra_bufts;
-    mparams.no_host         = params.no_host;
+    mparams.parallel_load    = params.parallel_load;
+    mparams.async_io_load    = params.async_io_load;
+    mparams.load_micro_stats = params.load_micro_stats;
+    mparams.check_tensors    = params.check_tensors;
+    mparams.use_extra_bufts  = !params.no_extra_bufts;
+    mparams.no_host          = params.no_host;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

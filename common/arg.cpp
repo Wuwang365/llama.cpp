@@ -2234,6 +2234,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PARALLEL_LOAD"));
     add_opt(common_arg(
+        {"--async-io-load"},
+        {"--no-async-io-load"},
+        string_format("use explicit async IO queues for non-mmap weight loading (default: %s)", params.async_io_load ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.async_io_load = value;
+        }
+    ).set_env("LLAMA_ARG_ASYNC_IO_LOAD"));
+    add_opt(common_arg(
+        {"--load-micro-stats"},
+        {"--no-load-micro-stats"},
+        string_format("print fine-grained weight loading timing statistics (default: %s)", params.load_micro_stats ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.load_micro_stats = value;
+        }
+    ).set_env("LLAMA_ARG_LOAD_MICRO_STATS"));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),

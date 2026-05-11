@@ -22,11 +22,15 @@
 #include "../src/ggml-ext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <exception>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -8444,13 +8448,237 @@ static void llama_load_tensor_data(
     ggml_backend_tensor_set(t, read_buf.data(), 0, n_size);
 }
 
+struct llama_tensor_io_task {
+    ggml_tensor * tensor;
+    uint16_t      file_idx;
+    size_t        offset;
+    size_t        size;
+};
+
+struct llama_load_timing_stats {
+    uint64_t alloc_ns        = 0;
+    uint64_t read_wall_ns    = 0;
+    uint64_t read_sum_ns     = 0;
+    uint64_t upload_wait_ns  = 0;
+    uint64_t upload_set_ns   = 0;
+    uint64_t total_ready_ns  = 0;
+    size_t   read_bytes      = 0;
+    size_t   upload_bytes    = 0;
+    size_t   n_tensors       = 0;
+    size_t   n_io_queues     = 0;
+};
+
+static uint64_t llama_time_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static double llama_ns_to_ms(uint64_t ns) {
+    return double(ns) / 1e6;
+}
+
+static double llama_bytes_per_second(size_t bytes, uint64_t ns) {
+    return ns > 0 ? 1e9 * double(bytes) / double(ns) : 0.0;
+}
+
+static std::string llama_format_load_bytes_per_second(double bytes_per_second) {
+    static const char * units[] = { "B/s", "KiB/s", "MiB/s", "GiB/s" };
+    double value = bytes_per_second;
+    int unit = 0;
+    while (value >= 1024.0 && unit < 3) {
+        value /= 1024.0;
+        ++unit;
+    }
+    return format("%.2f %s", value, units[unit]);
+}
+
+static size_t llama_async_io_queue_count(size_t n_tasks) {
+    if (n_tasks <= 1) {
+        return n_tasks;
+    }
+
+    size_t n_queues = 0;
+    if (const char * env = std::getenv("LLAMA_ASYNC_IO_QUEUES")) {
+        n_queues = std::max<size_t>(1, std::strtoul(env, nullptr, 10));
+    }
+    if (n_queues == 0) {
+        n_queues = std::max<size_t>(1, std::thread::hardware_concurrency() / 2);
+    }
+
+    // Mobile storage commonly exposes a small number of useful in-flight read channels.
+    // Keep the default conservative, while allowing explicit tuning through the env var.
+    n_queues = std::min<size_t>(n_queues, 4);
+    n_queues = std::min(n_queues, n_tasks);
+    return std::max<size_t>(1, n_queues);
+}
+
+static std::vector<std::vector<llama_tensor_io_task>> llama_build_contiguous_io_queues(
+        std::vector<llama_tensor_io_task> tasks,
+        size_t n_queues) {
+    std::sort(tasks.begin(), tasks.end(), [](const llama_tensor_io_task & a, const llama_tensor_io_task & b) {
+        if (a.file_idx != b.file_idx) {
+            return a.file_idx < b.file_idx;
+        }
+        return a.offset < b.offset;
+    });
+
+    size_t total = 0;
+    for (const auto & task : tasks) {
+        total += task.size;
+    }
+
+    std::vector<std::vector<llama_tensor_io_task>> queues(n_queues);
+    const size_t target = std::max<size_t>(1, (total + n_queues - 1) / n_queues);
+
+    size_t queue_idx = 0;
+    size_t queue_bytes = 0;
+    for (const auto & task : tasks) {
+        if (!queues[queue_idx].empty() && queue_idx + 1 < n_queues && queue_bytes >= target) {
+            ++queue_idx;
+            queue_bytes = 0;
+        }
+        queues[queue_idx].push_back(task);
+        queue_bytes += task.size;
+    }
+
+    queues.erase(std::remove_if(queues.begin(), queues.end(), [](const auto & queue) {
+        return queue.empty();
+    }), queues.end());
+    return queues;
+}
+
+static bool llama_load_all_tensor_data_async_io(
+        llama_model_loader & ml,
+        const std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs,
+        llama_load_timing_stats * timing_stats,
+        bool async_io_load) {
+    if (!async_io_load || ml.files.empty() || ml.use_mmap) {
+        return false;
+    }
+
+    std::vector<llama_tensor_io_task> tasks;
+    tasks.reserve(ml.n_tensors);
+
+    for (const auto & [ctx_ptr, _] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+            const auto * weight = ml.get_weight(ggml_get_name(t));
+            if (weight == nullptr) {
+                continue;
+            }
+            if (t->data == nullptr || t->buffer == nullptr) {
+                return false;
+            }
+
+            tasks.push_back({ t, weight->idx, weight->offs, ggml_nbytes(t) });
+        }
+    }
+
+    const size_t n_queues = llama_async_io_queue_count(tasks.size());
+    if (n_queues == 0) {
+        return false;
+    }
+
+    const size_t n_tasks = tasks.size();
+    auto queues = llama_build_contiguous_io_queues(std::move(tasks), n_queues);
+    if (queues.empty()) {
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: loading tensor data with %zu async IO queues\n", __func__, queues.size());
+
+    std::atomic<size_t> size_done{0};
+    std::atomic<uint64_t> read_sum_ns{0};
+    std::atomic<uint64_t> upload_wait_ns{0};
+    std::atomic<uint64_t> upload_set_ns{0};
+    std::atomic<size_t> upload_bytes{0};
+    std::mutex upload_mutex;
+    std::mutex error_mutex;
+    std::exception_ptr error;
+    std::vector<std::thread> workers;
+    workers.reserve(queues.size());
+
+    const uint64_t read_wall_start_ns = llama_time_now_ns();
+    for (auto & queue : queues) {
+        workers.emplace_back([&ml, &upload_mutex, &error_mutex, &error, &size_done, &read_sum_ns, &upload_wait_ns, &upload_set_ns, &upload_bytes, queue = std::move(queue)] {
+            try {
+                for (const auto & task : queue) {
+                    auto & file = ml.files.at(task.file_idx);
+
+                    const uint64_t read_start_ns = llama_time_now_ns();
+                    if (ggml_backend_buffer_is_host(task.tensor->buffer)) {
+                        file->read_raw_at(task.offset, task.tensor->data, task.size);
+                        read_sum_ns += llama_time_now_ns() - read_start_ns;
+                    } else {
+                        std::vector<no_init<uint8_t>> read_buf(task.size);
+                        file->read_raw_at(task.offset, read_buf.data(), task.size);
+                        read_sum_ns += llama_time_now_ns() - read_start_ns;
+
+                        const uint64_t upload_wait_start_ns = llama_time_now_ns();
+                        std::unique_lock<std::mutex> lock(upload_mutex);
+                        const uint64_t upload_set_start_ns = llama_time_now_ns();
+                        upload_wait_ns += upload_set_start_ns - upload_wait_start_ns;
+                        ggml_backend_tensor_set(task.tensor, read_buf.data(), 0, task.size);
+                        upload_set_ns += llama_time_now_ns() - upload_set_start_ns;
+                        upload_bytes += task.size;
+                    }
+
+                    size_done += task.size;
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!error) {
+                    error = std::current_exception();
+                }
+            }
+        });
+    }
+
+    for (auto & worker : workers) {
+        worker.join();
+    }
+
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    const uint64_t read_wall_ns = llama_time_now_ns() - read_wall_start_ns;
+
+    ml.size_done += size_done.load();
+    if (timing_stats) {
+        timing_stats->read_wall_ns  += read_wall_ns;
+        timing_stats->read_sum_ns   += read_sum_ns.load();
+        timing_stats->upload_wait_ns += upload_wait_ns.load();
+        timing_stats->upload_set_ns  += upload_set_ns.load();
+        timing_stats->read_bytes    += size_done.load();
+        timing_stats->upload_bytes  += upload_bytes.load();
+        timing_stats->n_tensors     += n_tasks;
+        timing_stats->n_io_queues    = std::max(timing_stats->n_io_queues, queues.size());
+    }
+    return true;
+}
+
 static bool llama_load_all_tensor_data_per_tensor(
         llama_model_loader & ml,
         bool use_mlock,
         llama_mlocks & mlock_mmaps,
         const std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs,
         llama_progress_callback progress_callback,
-        void * progress_callback_user_data) {
+        void * progress_callback_user_data,
+        llama_load_timing_stats * timing_stats,
+        bool async_io_load) {
+    if (progress_callback) {
+        const float progress = ml.size_data == 0 ? 0.0f : (float) ml.size_done / ml.size_data;
+        if (!progress_callback(progress, progress_callback_user_data)) {
+            return false;
+        }
+    }
+
+    if (!use_mlock && llama_load_all_tensor_data_async_io(ml, ctxs_bufs, timing_stats, async_io_load)) {
+        if (progress_callback) {
+            return progress_callback(1.0f, progress_callback_user_data);
+        }
+        return true;
+    }
+
     for (const auto & [ctx_ptr, _] : ctxs_bufs) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
             if (ml.get_weight(ggml_get_name(t)) == nullptr) {
@@ -8464,7 +8692,15 @@ static bool llama_load_all_tensor_data_per_tensor(
                 }
             }
 
+            const uint64_t load_start_ns = llama_time_now_ns();
             llama_load_tensor_data(ml, use_mlock, mlock_mmaps, t);
+            if (timing_stats) {
+                const uint64_t load_ns = llama_time_now_ns() - load_start_ns;
+                timing_stats->read_wall_ns += load_ns;
+                timing_stats->read_sum_ns  += load_ns;
+                timing_stats->read_bytes   += ggml_nbytes(t);
+                timing_stats->n_tensors++;
+            }
             ml.size_done += ggml_nbytes(t);
         }
     }
@@ -8474,6 +8710,25 @@ static bool llama_load_all_tensor_data_per_tensor(
     }
 
     return true;
+}
+
+static void llama_print_load_timing_stats(const llama_load_timing_stats & stats) {
+    LLAMA_LOG_INFO("%s: total ready time   = %8.2f ms\n", __func__, llama_ns_to_ms(stats.total_ready_ns));
+    LLAMA_LOG_INFO("%s: buffer alloc time  = %8.2f ms\n", __func__, llama_ns_to_ms(stats.alloc_ns));
+    LLAMA_LOG_INFO("%s: read wall time     = %8.2f ms, %s, queues = %zu, tensors = %zu\n",
+            __func__, llama_ns_to_ms(stats.read_wall_ns),
+            llama_format_load_bytes_per_second(llama_bytes_per_second(stats.read_bytes, stats.read_wall_ns)).c_str(),
+            stats.n_io_queues == 0 ? size_t(1) : stats.n_io_queues,
+            stats.n_tensors);
+    LLAMA_LOG_INFO("%s: read worker sum    = %8.2f ms, %s\n",
+            __func__, llama_ns_to_ms(stats.read_sum_ns),
+            llama_format_load_bytes_per_second(llama_bytes_per_second(stats.read_bytes, stats.read_sum_ns)).c_str());
+    LLAMA_LOG_INFO("%s: upload wait sum    = %8.2f ms\n",
+            __func__, llama_ns_to_ms(stats.upload_wait_ns));
+    LLAMA_LOG_INFO("%s: backend upload set = %8.2f ms, %s, bytes = %.2f MiB\n",
+            __func__, llama_ns_to_ms(stats.upload_set_ns),
+            llama_format_load_bytes_per_second(llama_bytes_per_second(stats.upload_bytes, stats.upload_set_ns)).c_str(),
+            stats.upload_bytes / 1024.0 / 1024.0);
 }
 
 bool llama_model::ensure_tensors_ready(std::string & err_msg) {
@@ -8542,6 +8797,8 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
     try {
         llama_model_loader & ml = *pimpl->lazy_loader;
         const bool use_mlock       = params.use_mlock;
+        llama_load_timing_stats timing_stats;
+        const uint64_t total_start_ns = params.load_micro_stats ? llama_time_now_ns() : 0;
 
         ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
         pimpl->mappings.clear();
@@ -8593,7 +8850,11 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
                     continue;
                 }
 
+                const uint64_t alloc_start_ns = params.load_micro_stats ? llama_time_now_ns() : 0;
                 llama_ensure_tensor_allocated(ml, use_mlock, pimpl->mlock_mmaps, pimpl->mlock_bufs, ctx, buft, &buf_map, bufs, t);
+                if (params.load_micro_stats) {
+                    timing_stats.alloc_ns += llama_time_now_ns() - alloc_start_ns;
+                }
             }
 
             // 2) Initialize views after their source tensors are allocated.
@@ -8609,7 +8870,9 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
                     pimpl->mlock_mmaps,
                     pimpl->ctxs_bufs,
                     params.progress_callback,
-                    params.progress_callback_user_data)) {
+                    params.progress_callback_user_data,
+                    params.load_micro_stats ? &timing_stats : nullptr,
+                    params.async_io_load)) {
             throw std::runtime_error("weight loading cancelled by progress callback");
         }
 
@@ -8621,6 +8884,11 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
                     throw std::runtime_error(format("tensor %s has no backing memory after lazy load", ggml_get_name(t)));
                 }
             }
+        }
+
+        if (params.load_micro_stats) {
+            timing_stats.total_ready_ns = llama_time_now_ns() - total_start_ns;
+            llama_print_load_timing_stats(timing_stats);
         }
 
         pimpl->lazy_load_done = true;
@@ -9753,6 +10021,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.parallel_load               =*/ false,
+        /*.async_io_load               =*/ false,
+        /*.load_micro_stats            =*/ false,
     };
 
     return result;
