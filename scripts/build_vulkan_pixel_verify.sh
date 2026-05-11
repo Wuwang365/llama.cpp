@@ -244,6 +244,11 @@ grep -Fq 'llama_load_all_tensor_data_async_io: loading tensor data with' "${LOG_
     exit 1
 }
 
+grep -Fq 'preallocated' "${LOG_FILE}" || {
+    echo "Verification log does not show async IO staging buffer preallocation: ${LOG_FILE}" >&2
+    exit 1
+}
+
 grep -Fq 'llama_print_load_timing_stats: read wall time' "${LOG_FILE}" || {
     echo "Verification log does not show load micro timing stats: ${LOG_FILE}" >&2
     exit 1

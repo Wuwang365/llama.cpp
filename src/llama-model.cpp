@@ -8586,6 +8586,28 @@ static bool llama_load_all_tensor_data_async_io(
 
     LLAMA_LOG_INFO("%s: loading tensor data with %zu async IO queues\n", __func__, queues.size());
 
+    const uint64_t staging_alloc_start_ns = timing_stats ? llama_time_now_ns() : 0;
+    std::vector<std::vector<no_init<uint8_t>>> staging_buffers;
+    staging_buffers.reserve(queues.size());
+    size_t staging_bytes = 0;
+    for (const auto & queue : queues) {
+        size_t staging_size = 0;
+        for (const auto & task : queue) {
+            if (!ggml_backend_buffer_is_host(task.tensor->buffer)) {
+                staging_size = std::max(staging_size, task.size);
+            }
+        }
+        staging_buffers.emplace_back(staging_size);
+        staging_bytes += staging_size;
+    }
+    if (timing_stats) {
+        timing_stats->alloc_ns += llama_time_now_ns() - staging_alloc_start_ns;
+    }
+    if (staging_bytes > 0) {
+        LLAMA_LOG_INFO("%s: preallocated %.2f MiB staging buffers for async IO\n",
+                __func__, staging_bytes / 1024.0 / 1024.0);
+    }
+
     std::atomic<size_t> size_done{0};
     std::atomic<uint64_t> read_sum_ns{0};
     std::atomic<uint64_t> upload_wait_ns{0};
@@ -8598,8 +8620,9 @@ static bool llama_load_all_tensor_data_async_io(
     workers.reserve(queues.size());
 
     const uint64_t read_wall_start_ns = llama_time_now_ns();
-    for (auto & queue : queues) {
-        workers.emplace_back([&ml, &upload_mutex, &error_mutex, &error, &size_done, &read_sum_ns, &upload_wait_ns, &upload_set_ns, &upload_bytes, queue = std::move(queue)] {
+    for (size_t i = 0; i < queues.size(); ++i) {
+        workers.emplace_back([&ml, &upload_mutex, &error_mutex, &error, &size_done, &read_sum_ns, &upload_wait_ns, &upload_set_ns, &upload_bytes,
+                queue = std::move(queues[i]), read_buf = std::move(staging_buffers[i])] () mutable {
             try {
                 for (const auto & task : queue) {
                     auto & file = ml.files.at(task.file_idx);
@@ -8609,7 +8632,7 @@ static bool llama_load_all_tensor_data_async_io(
                         file->read_raw_at(task.offset, task.tensor->data, task.size);
                         read_sum_ns += llama_time_now_ns() - read_start_ns;
                     } else {
-                        std::vector<no_init<uint8_t>> read_buf(task.size);
+                        GGML_ASSERT(read_buf.size() >= task.size);
                         file->read_raw_at(task.offset, read_buf.data(), task.size);
                         read_sum_ns += llama_time_now_ns() - read_start_ns;
 
