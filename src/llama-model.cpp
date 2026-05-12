@@ -8461,9 +8461,11 @@ struct llama_load_timing_stats {
     uint64_t read_sum_ns     = 0;
     uint64_t upload_wait_ns  = 0;
     uint64_t upload_set_ns   = 0;
+    uint64_t upload_sync_ns  = 0;
     uint64_t total_ready_ns  = 0;
     size_t   read_bytes      = 0;
     size_t   upload_bytes    = 0;
+    size_t   upload_batches  = 0;
     size_t   n_tensors       = 0;
     size_t   n_io_queues     = 0;
 };
@@ -8492,6 +8494,17 @@ static std::string llama_format_load_bytes_per_second(double bytes_per_second) {
     return format("%.2f %s", value, units[unit]);
 }
 
+static size_t llama_env_size_or_default(const char * name, size_t default_value) {
+    if (const char * env = std::getenv(name)) {
+        const size_t value = std::strtoull(env, nullptr, 10);
+        if (value > 0) {
+            return value;
+        }
+    }
+
+    return default_value;
+}
+
 static size_t llama_async_io_queue_count(size_t n_tasks) {
     if (n_tasks <= 1) {
         return n_tasks;
@@ -8511,6 +8524,241 @@ static size_t llama_async_io_queue_count(size_t n_tasks) {
     n_queues = std::min(n_queues, n_tasks);
     return std::max<size_t>(1, n_queues);
 }
+
+struct llama_async_upload_batcher {
+    static constexpr size_t n_buffers = 4;
+
+    ggml_backend_t upload_backend = nullptr;
+    ggml_backend_dev_t dev = nullptr;
+    std::vector<ggml_backend_buffer_t> host_buffers;
+    std::vector<ggml_backend_event_t> events;
+    std::vector<uint8_t *> host_ptrs;
+    std::vector<bool> submitted;
+    size_t buffer_size = 0;
+    size_t buffer_idx = 0;
+    size_t buffer_used = 0;
+    bool buffer_dirty = false;
+    bool backend_dirty = false;
+    uint64_t sync_ns = 0;
+    size_t batches = 0;
+
+    llama_async_upload_batcher() = default;
+    llama_async_upload_batcher(const llama_async_upload_batcher &) = delete;
+    llama_async_upload_batcher & operator=(const llama_async_upload_batcher &) = delete;
+
+    ~llama_async_upload_batcher() {
+        cleanup();
+    }
+
+    bool init(const std::vector<llama_tensor_io_task> & tasks, size_t max_tensor_size) {
+        if (max_tensor_size == 0) {
+            return false;
+        }
+
+        ggml_backend_dev_t first_dev = nullptr;
+        ggml_backend_buffer_type_t first_buft = nullptr;
+        for (const auto & task : tasks) {
+            if (ggml_backend_buffer_is_host(task.tensor->buffer)) {
+                continue;
+            }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(task.tensor->buffer);
+            ggml_backend_dev_t cur_dev = ggml_backend_buft_get_device(buft);
+            if (cur_dev == nullptr) {
+                LLAMA_LOG_INFO("%s: async upload batching disabled: no device found for buffer type %s\n",
+                        __func__, ggml_backend_buft_name(buft));
+                return false;
+            }
+            if (buft != ggml_backend_dev_buffer_type(cur_dev)) {
+                LLAMA_LOG_INFO("%s: async upload batching disabled: buffer type %s is not the default buffer type for device %s\n",
+                        __func__, ggml_backend_buft_name(buft), ggml_backend_dev_name(cur_dev));
+                return false;
+            }
+
+            if (first_dev == nullptr) {
+                first_dev = cur_dev;
+                first_buft = buft;
+            } else if (first_dev != cur_dev || first_buft != buft) {
+                LLAMA_LOG_INFO("%s: async upload batching disabled: found multiple device/buffer types in one load pass\n", __func__);
+                return false;
+            }
+        }
+
+        if (first_dev == nullptr) {
+            return false;
+        }
+
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(first_dev, &props);
+        if (!props.caps.async) {
+            LLAMA_LOG_INFO("%s: async upload batching disabled: device %s does not support async uploads\n",
+                    __func__, ggml_backend_dev_name(first_dev));
+            return false;
+        }
+
+        dev = first_dev;
+
+        upload_backend = ggml_backend_dev_init(dev, nullptr);
+        if (upload_backend == nullptr) {
+            LLAMA_LOG_DEBUG("%s: failed to initialize backend for async uploads on device %s\n",
+                    __func__, ggml_backend_dev_name(dev));
+            cleanup();
+            return false;
+        }
+
+        ggml_backend_buffer_type_t host_buft = props.caps.host_buffer && props.caps.events ? ggml_backend_dev_host_buffer_type(first_dev) : nullptr;
+        if (host_buft != nullptr) {
+            const size_t default_batch_mb = llama_env_size_or_default("LLAMA_ASYNC_IO_UPLOAD_BATCH_MB", 64);
+            buffer_size = std::max(max_tensor_size, default_batch_mb * 1024 * 1024);
+
+            for (size_t i = 0; i < n_buffers; ++i) {
+                ggml_backend_buffer_t host_buffer = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+                if (host_buffer == nullptr) {
+                    LLAMA_LOG_DEBUG("%s: failed to allocate async upload host buffer for device %s\n",
+                            __func__, ggml_backend_dev_name(dev));
+                    break;
+                }
+
+                ggml_backend_event_t event = ggml_backend_event_new(dev);
+                if (event == nullptr) {
+                    LLAMA_LOG_DEBUG("%s: failed to create async upload event for device %s\n",
+                            __func__, ggml_backend_dev_name(dev));
+                    ggml_backend_buffer_free(host_buffer);
+                    break;
+                }
+
+                host_buffers.push_back(host_buffer);
+                events.push_back(event);
+                host_ptrs.push_back(static_cast<uint8_t *>(ggml_backend_buffer_get_base(host_buffer)));
+                submitted.push_back(false);
+            }
+
+            if (host_buffers.size() != n_buffers) {
+                for (ggml_backend_event_t event : events) {
+                    ggml_backend_event_free(event);
+                }
+                for (ggml_backend_buffer_t host_buffer : host_buffers) {
+                    ggml_backend_buffer_free(host_buffer);
+                }
+                events.clear();
+                host_buffers.clear();
+                host_ptrs.clear();
+                submitted.clear();
+                buffer_size = 0;
+            }
+        }
+
+        if (host_buffers.empty() && std::string(ggml_backend_name(upload_backend)).find("Vulkan") == std::string::npos) {
+            LLAMA_LOG_INFO("%s: async upload batching disabled: backend-managed staging is only enabled for Vulkan backends\n",
+                    __func__);
+            cleanup();
+            return false;
+        }
+
+        if (!host_buffers.empty()) {
+            LLAMA_LOG_INFO("%s: batching backend uploads on %s with %zu pinned buffers of %.2f MiB\n",
+                    __func__, ggml_backend_dev_name(dev), host_buffers.size(), buffer_size / 1024.0 / 1024.0);
+        } else {
+            LLAMA_LOG_INFO("%s: batching backend uploads on %s with backend-managed staging\n",
+                    __func__, ggml_backend_dev_name(dev));
+        }
+        return true;
+    }
+
+    bool active() const {
+        return upload_backend != nullptr;
+    }
+
+    void upload(ggml_tensor * tensor, const void * data, size_t size) {
+        GGML_ASSERT(active());
+
+        if (host_buffers.empty()) {
+            ggml_backend_tensor_set_async(upload_backend, tensor, data, 0, size);
+            backend_dirty = true;
+            return;
+        }
+
+        GGML_ASSERT(size <= buffer_size);
+
+        if (buffer_used + size > buffer_size) {
+            flush_current();
+        }
+
+        wait_for_buffer(buffer_idx);
+
+        memcpy(host_ptrs[buffer_idx] + buffer_used, data, size);
+        ggml_backend_tensor_set_async(upload_backend, tensor, host_ptrs[buffer_idx] + buffer_used, 0, size);
+        buffer_used += size;
+        buffer_dirty = true;
+    }
+
+    void finalize() {
+        if (!active()) {
+            return;
+        }
+
+        if (host_buffers.empty()) {
+            if (backend_dirty) {
+                const uint64_t sync_start_ns = llama_time_now_ns();
+                ggml_backend_synchronize(upload_backend);
+                sync_ns += llama_time_now_ns() - sync_start_ns;
+                backend_dirty = false;
+                ++batches;
+            }
+        } else {
+            flush_current();
+            for (size_t i = 0; i < events.size(); ++i) {
+                wait_for_buffer(i);
+            }
+        }
+    }
+
+    void cleanup() {
+        finalize();
+
+        for (ggml_backend_event_t event : events) {
+            ggml_backend_event_free(event);
+        }
+        events.clear();
+
+        for (ggml_backend_buffer_t host_buffer : host_buffers) {
+            ggml_backend_buffer_free(host_buffer);
+        }
+        host_buffers.clear();
+        host_ptrs.clear();
+        submitted.clear();
+
+        if (upload_backend != nullptr) {
+            ggml_backend_free(upload_backend);
+            upload_backend = nullptr;
+        }
+    }
+
+private:
+    void flush_current() {
+        if (!buffer_dirty) {
+            return;
+        }
+
+        ggml_backend_event_record(events[buffer_idx], upload_backend);
+        submitted[buffer_idx] = true;
+        buffer_dirty = false;
+        buffer_used = 0;
+        ++batches;
+        buffer_idx = (buffer_idx + 1) % host_buffers.size();
+    }
+
+    void wait_for_buffer(size_t idx) {
+        if (!submitted[idx]) {
+            return;
+        }
+
+        const uint64_t sync_start_ns = llama_time_now_ns();
+        ggml_backend_event_synchronize(events[idx]);
+        sync_ns += llama_time_now_ns() - sync_start_ns;
+        submitted[idx] = false;
+    }
+};
 
 static std::vector<std::vector<llama_tensor_io_task>> llama_build_contiguous_io_queues(
         std::vector<llama_tensor_io_task> tasks,
@@ -8578,6 +8826,16 @@ static bool llama_load_all_tensor_data_async_io(
         return false;
     }
 
+    size_t max_non_host_tensor_size = 0;
+    for (const auto & task : tasks) {
+        if (!ggml_backend_buffer_is_host(task.tensor->buffer)) {
+            max_non_host_tensor_size = std::max(max_non_host_tensor_size, task.size);
+        }
+    }
+
+    llama_async_upload_batcher upload_batcher;
+    const bool batch_uploads = upload_batcher.init(tasks, max_non_host_tensor_size);
+
     const size_t n_tasks = tasks.size();
     auto queues = llama_build_contiguous_io_queues(std::move(tasks), n_queues);
     if (queues.empty()) {
@@ -8621,7 +8879,7 @@ static bool llama_load_all_tensor_data_async_io(
 
     const uint64_t read_wall_start_ns = llama_time_now_ns();
     for (size_t i = 0; i < queues.size(); ++i) {
-        workers.emplace_back([&ml, &upload_mutex, &error_mutex, &error, &size_done, &read_sum_ns, &upload_wait_ns, &upload_set_ns, &upload_bytes,
+        workers.emplace_back([&ml, &upload_mutex, &upload_batcher, batch_uploads, &error_mutex, &error, &size_done, &read_sum_ns, &upload_wait_ns, &upload_set_ns, &upload_bytes,
                 queue = std::move(queues[i]), read_buf = std::move(staging_buffers[i])] () mutable {
             try {
                 for (const auto & task : queue) {
@@ -8640,7 +8898,11 @@ static bool llama_load_all_tensor_data_async_io(
                         std::unique_lock<std::mutex> lock(upload_mutex);
                         const uint64_t upload_set_start_ns = llama_time_now_ns();
                         upload_wait_ns += upload_set_start_ns - upload_wait_start_ns;
-                        ggml_backend_tensor_set(task.tensor, read_buf.data(), 0, task.size);
+                        if (batch_uploads) {
+                            upload_batcher.upload(task.tensor, read_buf.data(), task.size);
+                        } else {
+                            ggml_backend_tensor_set(task.tensor, read_buf.data(), 0, task.size);
+                        }
                         upload_set_ns += llama_time_now_ns() - upload_set_start_ns;
                         upload_bytes += task.size;
                     }
@@ -8660,6 +8922,11 @@ static bool llama_load_all_tensor_data_async_io(
         worker.join();
     }
 
+    if (batch_uploads) {
+        std::lock_guard<std::mutex> lock(upload_mutex);
+        upload_batcher.finalize();
+    }
+
     if (error) {
         std::rethrow_exception(error);
     }
@@ -8671,8 +8938,10 @@ static bool llama_load_all_tensor_data_async_io(
         timing_stats->read_sum_ns   += read_sum_ns.load();
         timing_stats->upload_wait_ns += upload_wait_ns.load();
         timing_stats->upload_set_ns  += upload_set_ns.load();
+        timing_stats->upload_sync_ns += upload_batcher.sync_ns;
         timing_stats->read_bytes    += size_done.load();
         timing_stats->upload_bytes  += upload_bytes.load();
+        timing_stats->upload_batches += upload_batcher.batches;
         timing_stats->n_tensors     += n_tasks;
         timing_stats->n_io_queues    = std::max(timing_stats->n_io_queues, queues.size());
     }
@@ -8752,6 +9021,12 @@ static void llama_print_load_timing_stats(const llama_load_timing_stats & stats)
             __func__, llama_ns_to_ms(stats.upload_set_ns),
             llama_format_load_bytes_per_second(llama_bytes_per_second(stats.upload_bytes, stats.upload_set_ns)).c_str(),
             stats.upload_bytes / 1024.0 / 1024.0);
+    if (stats.upload_batches > 0 || stats.upload_sync_ns > 0) {
+        LLAMA_LOG_INFO("%s: upload sync wait  = %8.2f ms, batches = %zu, avg = %.2f MiB\n",
+                __func__, llama_ns_to_ms(stats.upload_sync_ns),
+                stats.upload_batches,
+                stats.upload_batches == 0 ? 0.0 : stats.upload_bytes / 1024.0 / 1024.0 / double(stats.upload_batches));
+    }
 }
 
 bool llama_model::ensure_tensors_ready(std::string & err_msg) {

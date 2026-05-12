@@ -39,6 +39,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <mutex>
 #include <future>
 #include <thread>
+#include <cstdlib>
 
 #if defined(_MSC_VER)
 # define NOMINMAX 1
@@ -1909,6 +1910,7 @@ struct ggml_backend_vk_context {
     vk_context_ref transfer_ctx;
     vk_semaphore transfer_semaphore;
     uint64_t transfer_semaphore_last_submitted {};
+    size_t sync_staging_used {};
 
     std::vector<vk_context_ref> tensor_ctxs;
 
@@ -6671,7 +6673,70 @@ static void ggml_vk_ensure_sync_staging_buffer(ggml_backend_vk_context * ctx, si
         ctx->sync_staging = ggml_vk_create_buffer_check(ctx->device, size,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        ctx->sync_staging_used = 0;
     }
+}
+
+static size_t ggml_vk_upload_batch_size(size_t min_size) {
+    size_t batch_mb = 64;
+    if (const char * env = std::getenv("LLAMA_ASYNC_IO_UPLOAD_BATCH_MB")) {
+        const size_t value = std::strtoull(env, nullptr, 10);
+        if (value > 0) {
+            batch_mb = value;
+        }
+    }
+
+    return std::max(min_size, batch_mb * 1024 * 1024);
+}
+
+static vk_context ggml_vk_get_transfer_or_compute_ctx(ggml_backend_vk_context * ctx) {
+    if (ctx->device->async_use_transfer_queue) {
+        vk_context cpy_ctx;
+        if (ctx->transfer_ctx.expired()) {
+            cpy_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+            ctx->transfer_ctx = cpy_ctx;
+            ggml_vk_ctx_begin(ctx->device, cpy_ctx);
+        } else {
+            cpy_ctx = ctx->transfer_ctx.lock();
+        }
+        return cpy_ctx;
+    }
+
+    return ggml_vk_get_compute_ctx(ctx);
+}
+
+static void ggml_vk_buffer_write_staged_async(ggml_backend_vk_context * ctx, vk_buffer& dst, size_t offset, const void * src, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
+    const size_t aligned_used = ggml_vk_align_size(ctx->sync_staging_used, 4);
+    const bool need_realloc = ctx->sync_staging == nullptr || ctx->sync_staging->size < size;
+    const bool need_flush = !need_realloc && aligned_used + size > ctx->sync_staging->size;
+
+    if (need_realloc || need_flush) {
+        ggml_vk_synchronize(ctx);
+        ctx->sync_staging_used = 0;
+    }
+
+    if (need_realloc) {
+        ggml_vk_ensure_sync_staging_buffer(ctx, ggml_vk_upload_batch_size(size));
+    }
+
+    const size_t staging_offset = ggml_vk_align_size(ctx->sync_staging_used, 4);
+    GGML_ASSERT(ctx->sync_staging != nullptr);
+    GGML_ASSERT(staging_offset + size <= ctx->sync_staging->size);
+
+    vk_context cpy_ctx = ggml_vk_get_transfer_or_compute_ctx(ctx);
+    vk::BufferCopy buffer_cpy;
+    buffer_cpy.srcOffset = staging_offset;
+    buffer_cpy.dstOffset = offset;
+    buffer_cpy.size = size;
+
+    memcpy((uint8_t *) ctx->sync_staging->ptr + staging_offset, src, size);
+    ggml_vk_sync_buffers(nullptr, cpy_ctx);
+    cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, dst->buffer, { buffer_cpy });
+    ctx->sync_staging_used = staging_offset + size;
 }
 
 static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_context& subctx, vk_buffer& dst, size_t offset, const ggml_tensor * tensor, bool sync_staging = false) {
@@ -13717,20 +13782,7 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
-    vk_context cpy_ctx;
-
-    if (ctx->device->async_use_transfer_queue) {
-        if (ctx->transfer_ctx.expired()) {
-            // Initialize new transfer context
-            cpy_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
-            ctx->transfer_ctx = cpy_ctx;
-            ggml_vk_ctx_begin(ctx->device, cpy_ctx);
-        } else {
-            cpy_ctx = ctx->transfer_ctx.lock();
-        }
-    } else {
-        cpy_ctx = ggml_vk_get_compute_ctx(ctx);
-    }
+    vk_context cpy_ctx = ggml_vk_get_transfer_or_compute_ctx(ctx);
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
@@ -13739,17 +13791,7 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     bool ret = ggml_vk_buffer_write_async(cpy_ctx, buf, dst_offset, data, size);
 
     if (!ret) {
-        ggml_vk_ensure_sync_staging_buffer(ctx, size);
-        ggml_vk_sync_buffers(nullptr, cpy_ctx);
-
-        vk::BufferCopy buffer_cpy;
-        buffer_cpy.srcOffset = 0;
-        buffer_cpy.dstOffset = dst_offset;
-        buffer_cpy.size = size;
-
-        cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, buf->buffer, { buffer_cpy });
-        deferred_memcpy(ctx->sync_staging->ptr, data, size, &cpy_ctx->in_memcpys);
-        ggml_vk_synchronize(ctx);
+        ggml_vk_buffer_write_staged_async(ctx, buf, dst_offset, data, size);
     }
 }
 
@@ -13910,6 +13952,8 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+
+    ctx->sync_staging_used = 0;
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
