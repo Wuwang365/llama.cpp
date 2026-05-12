@@ -26,6 +26,7 @@
 #include <cassert>
 #include <chrono>
 #include <cfloat>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -42,6 +43,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -659,9 +661,30 @@ struct llama_model::impl {
 
     // lazy weight loading state
     std::mutex lazy_load_mutex;
+    enum class lazy_group_state {
+        unloaded,
+        loading,
+        ready,
+        failed,
+    };
+
+    struct lazy_weight_group {
+        std::mutex mutex;
+        std::condition_variable cv;
+        lazy_group_state state = lazy_group_state::unloaded;
+        std::string error;
+        std::vector<ggml_tensor *> tensors;
+    };
+
+    lazy_weight_group lazy_global_group;
+    std::vector<std::unique_ptr<lazy_weight_group>> lazy_layer_groups;
+    lazy_weight_group lazy_output_group;
+    std::unordered_map<ggml_tensor *, lazy_weight_group *> lazy_tensor_to_group;
+    bool lazy_alloc_done = false;
     bool lazy_load_done   = false;
     bool lazy_load_failed = false;
     bool lazy_load_async_started = false;
+    bool lazy_load_async_in_progress = false;
     std::string lazy_load_error;
     std::thread lazy_load_thread;
     std::unique_ptr<llama_model_loader> lazy_loader;
@@ -698,6 +721,34 @@ static std::optional<llama_tensor_location> llama_find_tensor_location(
         }
     }
     return std::nullopt;
+}
+
+static int llama_parse_layer_from_tensor_name(const char * name) {
+    const char * blk = std::strstr(name, "blk.");
+    if (blk == nullptr) {
+        return -1;
+    }
+
+    const char * cur = blk + 4;
+    if (*cur < '0' || *cur > '9') {
+        return -1;
+    }
+
+    int il = 0;
+    while (*cur >= '0' && *cur <= '9') {
+        il = il * 10 + (*cur - '0');
+        ++cur;
+    }
+
+    return *cur == '.' ? il : -1;
+}
+
+static bool llama_tensor_name_is_output(const char * name) {
+    return std::strncmp(name, "output", 6) == 0 ||
+           std::strncmp(name, "enc.output", 10) == 0 ||
+           std::strncmp(name, "dec.output", 10) == 0 ||
+           std::strncmp(name, "cls", 3) == 0 ||
+           std::strncmp(name, "dense", 5) == 0;
 }
 
 static ggml_backend_dev_t llama_get_buft_device_or_cpu(ggml_backend_buffer_type_t buft, const char * func) {
@@ -8162,6 +8213,34 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    pimpl->lazy_global_group.tensors.clear();
+    pimpl->lazy_output_group.tensors.clear();
+    pimpl->lazy_layer_groups.clear();
+    pimpl->lazy_layer_groups.reserve(hparams.n_layer);
+    pimpl->lazy_tensor_to_group.clear();
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        pimpl->lazy_layer_groups.emplace_back(new impl::lazy_weight_group);
+    }
+
+    for (auto & [name, tensor] : tensors_by_name) {
+        if (tensor->view_src != nullptr) {
+            continue;
+        }
+
+        impl::lazy_weight_group * group = nullptr;
+        const int il = llama_parse_layer_from_tensor_name(name.c_str());
+        if (il >= 0 && il < (int) pimpl->lazy_layer_groups.size()) {
+            group = pimpl->lazy_layer_groups[il].get();
+        } else if (llama_tensor_name_is_output(name.c_str())) {
+            group = &pimpl->lazy_output_group;
+        } else {
+            group = &pimpl->lazy_global_group;
+        }
+
+        group->tensors.push_back(tensor);
+        pimpl->lazy_tensor_to_group.emplace(tensor, group);
+    }
+
     const bool lazy_load = !ml.no_alloc;
 
     // create placeholder backend buffers: tensor metadata is initialized here, concrete
@@ -8245,10 +8324,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     if (lazy_load) {
         pimpl->lazy_ctx_buf_maps = std::move(ctx_buf_maps);
         pimpl->lazy_loader.reset(new llama_model_loader(std::move(ml)));
+        pimpl->lazy_alloc_done = false;
         pimpl->lazy_load_done   = false;
         pimpl->lazy_load_failed = false;
         pimpl->lazy_load_async_started = false;
+        pimpl->lazy_load_async_in_progress = false;
         pimpl->lazy_load_error.clear();
+        auto reset_group = [](impl::lazy_weight_group & group) {
+            group.state = impl::lazy_group_state::unloaded;
+            group.error.clear();
+        };
+        reset_group(pimpl->lazy_global_group);
+        for (auto & group : pimpl->lazy_layer_groups) {
+            reset_group(*group);
+        }
+        reset_group(pimpl->lazy_output_group);
         LLAMA_LOG_INFO("%s: deferring weight allocation/load%s\n", __func__,
             params.parallel_load ? " until context init background preload" : " until first inference");
         return true;
@@ -8269,6 +8359,7 @@ void llama_model::start_async_tensors_load() {
             return;
         }
         pimpl->lazy_load_async_started = true;
+        pimpl->lazy_load_async_in_progress = true;
         start = true;
     }
 
@@ -9029,6 +9120,428 @@ static void llama_print_load_timing_stats(const llama_load_timing_stats & stats)
     }
 }
 
+struct llama_model_lazy_access {
+static void prepare_lazy_allocations(llama_model & model, llama_load_timing_stats * timing_stats) {
+    llama_model_loader & ml = *model.pimpl->lazy_loader;
+    const bool use_mlock = model.params.use_mlock;
+
+    ml.init_mappings(true, use_mlock ? &model.pimpl->mlock_mmaps : nullptr);
+    model.pimpl->mappings.clear();
+    model.pimpl->mappings.reserve(ml.mappings.size());
+    model.pimpl->mlock_bufs.clear();
+
+    std::unordered_map<ggml_context *, ggml_backend_buffer_type_t> ctx_buft_by_ptr;
+    ctx_buft_by_ptr.reserve(model.pimpl->lazy_ctx_buft.size());
+    for (const auto & [ctx, buft] : model.pimpl->lazy_ctx_buft) {
+        ctx_buft_by_ptr.emplace(ctx, buft);
+    }
+
+    std::unordered_map<ggml_context *, llama_buf_map *> ctx_buf_map_by_ptr;
+    ctx_buf_map_by_ptr.reserve(model.pimpl->lazy_ctx_buf_maps.size());
+    for (auto & [ctx, buf_map] : model.pimpl->lazy_ctx_buf_maps) {
+        ctx_buf_map_by_ptr.emplace(ctx, &buf_map);
+    }
+
+    for (auto & [ctx_ptr, bufs] : model.pimpl->ctxs_bufs) {
+        ggml_context * ctx = ctx_ptr.get();
+        if (ggml_get_first_tensor(ctx) == nullptr) {
+            continue;
+        }
+
+        auto it_buft = ctx_buft_by_ptr.find(ctx);
+        if (it_buft == ctx_buft_by_ptr.end()) {
+            throw std::runtime_error("internal error: missing buffer type for model context");
+        }
+        ggml_backend_buffer_type_t buft = it_buft->second;
+
+        auto it_buf_map = ctx_buf_map_by_ptr.find(ctx);
+        if (it_buf_map == ctx_buf_map_by_ptr.end()) {
+            throw std::runtime_error("internal error: missing source buffer map for model context");
+        }
+        llama_buf_map & buf_map = *it_buf_map->second;
+        buf_map.clear();
+
+        // release placeholder buffers, then reset tensor pointers for final allocation.
+        bufs.clear();
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            t->buffer        = nullptr;
+            t->weight_buffer = nullptr;
+            t->data          = nullptr;
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr || t->buffer != nullptr || t->data != nullptr) {
+                continue;
+            }
+
+            const uint64_t alloc_start_ns = model.params.load_micro_stats ? llama_time_now_ns() : 0;
+            llama_ensure_tensor_allocated(ml, use_mlock, model.pimpl->mlock_mmaps, model.pimpl->mlock_bufs, ctx, buft, &buf_map, bufs, t);
+            if (timing_stats && model.params.load_micro_stats) {
+                timing_stats->alloc_ns += llama_time_now_ns() - alloc_start_ns;
+            }
+        }
+
+        llama_refresh_tensor_views(ctx);
+        llama_refresh_weight_handles(ctx);
+    }
+
+    model.pimpl->lazy_alloc_done = true;
+}
+
+static void load_tensor_group_data(
+        llama_model & model,
+        llama_model::impl::lazy_weight_group & group,
+        llama_load_timing_stats * timing_stats) {
+    llama_model_loader & ml = *model.pimpl->lazy_loader;
+
+    std::unordered_map<ggml_context *, ggml_backend_buffer_type_t> ctx_buft_by_ptr;
+    ctx_buft_by_ptr.reserve(model.pimpl->lazy_ctx_buft.size());
+    for (const auto & [ctx, buft] : model.pimpl->lazy_ctx_buft) {
+        ctx_buft_by_ptr.emplace(ctx, buft);
+    }
+
+    std::unordered_set<ggml_context *> refreshed;
+
+    for (ggml_tensor * t : group.tensors) {
+        if (ml.get_weight(ggml_get_name(t)) == nullptr) {
+            continue;
+        }
+
+        if (model.params.progress_callback) {
+            const float progress = ml.size_data == 0 ? 0.0f : (float) ml.size_done / ml.size_data;
+            if (!model.params.progress_callback(progress, model.params.progress_callback_user_data)) {
+                throw std::runtime_error("weight loading cancelled by progress callback");
+            }
+        }
+
+        if (!llama_tensor_has_backing_memory(t)) {
+            auto loc = llama_find_tensor_location(model.pimpl->ctxs_bufs, t);
+            if (!loc.has_value()) {
+                throw std::runtime_error(format("internal error: tensor %s was not found in model contexts", ggml_get_name(t)));
+            }
+
+            auto it_buft = ctx_buft_by_ptr.find(loc->ctx);
+            if (it_buft == ctx_buft_by_ptr.end()) {
+                throw std::runtime_error("internal error: missing buffer type for model context");
+            }
+
+            const uint64_t alloc_start_ns = model.params.load_micro_stats ? llama_time_now_ns() : 0;
+            llama_ensure_tensor_allocated(ml, model.params.use_mlock, model.pimpl->mlock_mmaps, model.pimpl->mlock_bufs,
+                    loc->ctx, it_buft->second, nullptr, *loc->bufs, t);
+            if (timing_stats && model.params.load_micro_stats) {
+                timing_stats->alloc_ns += llama_time_now_ns() - alloc_start_ns;
+            }
+
+            refreshed.insert(loc->ctx);
+            llama_refresh_tensor_views(loc->ctx);
+            llama_refresh_weight_handles(loc->ctx);
+        }
+    }
+
+    std::vector<llama_tensor_io_task> tasks;
+    tasks.reserve(group.tensors.size());
+    for (ggml_tensor * t : group.tensors) {
+        const auto * weight = ml.get_weight(ggml_get_name(t));
+        if (weight == nullptr) {
+            continue;
+        }
+        if (t->data == nullptr || t->buffer == nullptr) {
+            throw std::runtime_error(format("tensor %s has no backing memory before group load", ggml_get_name(t)));
+        }
+        tasks.push_back({ t, weight->idx, weight->offs, ggml_nbytes(t) });
+    }
+
+    const bool can_async_io = model.params.async_io_load && !model.params.use_mlock && !ml.files.empty() && !ml.use_mmap && !tasks.empty();
+    if (can_async_io) {
+        const size_t n_queues = llama_async_io_queue_count(tasks.size());
+        size_t max_non_host_tensor_size = 0;
+        for (const auto & task : tasks) {
+            if (!ggml_backend_buffer_is_host(task.tensor->buffer)) {
+                max_non_host_tensor_size = std::max(max_non_host_tensor_size, task.size);
+            }
+        }
+
+        llama_async_upload_batcher upload_batcher;
+        const bool batch_uploads = upload_batcher.init(tasks, max_non_host_tensor_size);
+        const size_t n_tasks = tasks.size();
+        auto queues = llama_build_contiguous_io_queues(std::move(tasks), n_queues);
+        if (!queues.empty()) {
+            LLAMA_LOG_INFO("llama_load_all_tensor_data_async_io: loading tensor data with %zu async IO queues\n", queues.size());
+
+            const uint64_t staging_alloc_start_ns = timing_stats ? llama_time_now_ns() : 0;
+            std::vector<std::vector<no_init<uint8_t>>> staging_buffers;
+            staging_buffers.reserve(queues.size());
+            size_t staging_bytes = 0;
+            for (const auto & queue : queues) {
+                size_t staging_size = 0;
+                for (const auto & task : queue) {
+                    if (!ggml_backend_buffer_is_host(task.tensor->buffer)) {
+                        staging_size = std::max(staging_size, task.size);
+                    }
+                }
+                staging_buffers.emplace_back(staging_size);
+                staging_bytes += staging_size;
+            }
+            if (timing_stats) {
+                timing_stats->alloc_ns += llama_time_now_ns() - staging_alloc_start_ns;
+            }
+            if (staging_bytes > 0) {
+                LLAMA_LOG_INFO("llama_load_all_tensor_data_async_io: preallocated %.2f MiB staging buffers for async IO\n",
+                        staging_bytes / 1024.0 / 1024.0);
+            }
+
+            std::atomic<size_t> size_done{0};
+            std::atomic<uint64_t> read_sum_ns{0};
+            std::atomic<uint64_t> upload_wait_ns{0};
+            std::atomic<uint64_t> upload_set_ns{0};
+            std::atomic<size_t> upload_bytes{0};
+            std::mutex upload_mutex;
+            std::mutex error_mutex;
+            std::exception_ptr error;
+            std::vector<std::thread> workers;
+            workers.reserve(queues.size());
+
+            const uint64_t read_wall_start_ns = llama_time_now_ns();
+            for (size_t i = 0; i < queues.size(); ++i) {
+                workers.emplace_back([&ml, &upload_mutex, &upload_batcher, batch_uploads, &error_mutex, &error, &size_done, &read_sum_ns, &upload_wait_ns, &upload_set_ns, &upload_bytes,
+                        queue = std::move(queues[i]), read_buf = std::move(staging_buffers[i])] () mutable {
+                    try {
+                        for (const auto & task : queue) {
+                            auto & file = ml.files.at(task.file_idx);
+
+                            const uint64_t read_start_ns = llama_time_now_ns();
+                            if (ggml_backend_buffer_is_host(task.tensor->buffer)) {
+                                file->read_raw_at(task.offset, task.tensor->data, task.size);
+                                read_sum_ns += llama_time_now_ns() - read_start_ns;
+                            } else {
+                                GGML_ASSERT(read_buf.size() >= task.size);
+                                file->read_raw_at(task.offset, read_buf.data(), task.size);
+                                read_sum_ns += llama_time_now_ns() - read_start_ns;
+
+                                const uint64_t upload_wait_start_ns = llama_time_now_ns();
+                                std::unique_lock<std::mutex> lock(upload_mutex);
+                                const uint64_t upload_set_start_ns = llama_time_now_ns();
+                                upload_wait_ns += upload_set_start_ns - upload_wait_start_ns;
+                                if (batch_uploads) {
+                                    upload_batcher.upload(task.tensor, read_buf.data(), task.size);
+                                } else {
+                                    ggml_backend_tensor_set(task.tensor, read_buf.data(), 0, task.size);
+                                }
+                                upload_set_ns += llama_time_now_ns() - upload_set_start_ns;
+                                upload_bytes += task.size;
+                            }
+
+                            size_done += task.size;
+                        }
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(error_mutex);
+                        if (!error) {
+                            error = std::current_exception();
+                        }
+                    }
+                });
+            }
+
+            for (auto & worker : workers) {
+                worker.join();
+            }
+
+            if (batch_uploads) {
+                std::lock_guard<std::mutex> lock(upload_mutex);
+                upload_batcher.finalize();
+            }
+
+            if (error) {
+                std::rethrow_exception(error);
+            }
+
+            const uint64_t read_wall_ns = llama_time_now_ns() - read_wall_start_ns;
+            ml.size_done += size_done.load();
+            if (timing_stats) {
+                timing_stats->read_wall_ns  += read_wall_ns;
+                timing_stats->read_sum_ns   += read_sum_ns.load();
+                timing_stats->upload_wait_ns += upload_wait_ns.load();
+                timing_stats->upload_set_ns  += upload_set_ns.load();
+                timing_stats->upload_sync_ns += upload_batcher.sync_ns;
+                timing_stats->read_bytes    += size_done.load();
+                timing_stats->upload_bytes  += upload_bytes.load();
+                timing_stats->upload_batches += upload_batcher.batches;
+                timing_stats->n_tensors     += n_tasks;
+                timing_stats->n_io_queues    = std::max(timing_stats->n_io_queues, queues.size());
+            }
+        }
+    } else {
+        for (ggml_tensor * t : group.tensors) {
+            if (ml.get_weight(ggml_get_name(t)) == nullptr) {
+                continue;
+            }
+
+            const uint64_t load_start_ns = model.params.load_micro_stats ? llama_time_now_ns() : 0;
+            llama_load_tensor_data(ml, model.params.use_mlock, model.pimpl->mlock_mmaps, t);
+            if (timing_stats && model.params.load_micro_stats) {
+                const uint64_t load_ns = llama_time_now_ns() - load_start_ns;
+                timing_stats->read_wall_ns += load_ns;
+                timing_stats->read_sum_ns  += load_ns;
+                timing_stats->read_bytes   += ggml_nbytes(t);
+                timing_stats->n_tensors++;
+            }
+            ml.size_done += ggml_nbytes(t);
+        }
+    }
+
+    for (ggml_context * ctx : refreshed) {
+        llama_refresh_tensor_views(ctx);
+        llama_refresh_weight_handles(ctx);
+    }
+
+    if (model.params.progress_callback) {
+        const float progress = ml.size_data == 0 ? 1.0f : std::min(1.0f, (float) ml.size_done / ml.size_data);
+        if (!model.params.progress_callback(progress, model.params.progress_callback_user_data)) {
+            throw std::runtime_error("weight loading cancelled by progress callback");
+        }
+    }
+}
+
+static void set_group_state(
+        llama_model::impl::lazy_weight_group & group,
+        llama_model::impl::lazy_group_state state,
+        const std::string & error = {}) {
+    {
+        std::lock_guard<std::mutex> group_lock(group.mutex);
+        group.state = state;
+        group.error = error;
+    }
+    group.cv.notify_all();
+}
+
+static void set_all_group_states(
+        llama_model & model,
+        llama_model::impl::lazy_group_state state,
+        const std::string & error = {}) {
+    set_group_state(model.pimpl->lazy_global_group, state, error);
+    for (auto & group : model.pimpl->lazy_layer_groups) {
+        set_group_state(*group, state, error);
+    }
+    set_group_state(model.pimpl->lazy_output_group, state, error);
+}
+
+static void load_all_tensor_data(
+        llama_model & model,
+        llama_load_timing_stats * timing_stats) {
+    if (!llama_load_all_tensor_data_per_tensor(
+                *model.pimpl->lazy_loader,
+                model.params.use_mlock,
+                model.pimpl->mlock_mmaps,
+                model.pimpl->ctxs_bufs,
+                model.params.progress_callback,
+                model.params.progress_callback_user_data,
+                timing_stats,
+                model.params.async_io_load)) {
+        throw std::runtime_error("weight loading cancelled by progress callback");
+    }
+}
+
+static bool ensure_group_ready(
+        llama_model & model,
+        llama_model::impl::lazy_weight_group & group,
+        std::string & err_msg,
+        llama_load_timing_stats * timing_stats = nullptr) {
+    err_msg.clear();
+
+    if (model.hparams.vocab_only || model.hparams.no_alloc) {
+        return true;
+    }
+
+    {
+        std::unique_lock<std::mutex> group_lock(group.mutex);
+        if (group.state == llama_model::impl::lazy_group_state::ready) {
+            return true;
+        }
+        if (group.state == llama_model::impl::lazy_group_state::failed) {
+            err_msg = group.error;
+            return false;
+        }
+        if (group.state == llama_model::impl::lazy_group_state::loading) {
+            group.cv.wait(group_lock, [&] {
+                return group.state != llama_model::impl::lazy_group_state::loading;
+            });
+            if (group.state == llama_model::impl::lazy_group_state::ready) {
+                return true;
+            }
+            err_msg = group.error;
+            return false;
+        }
+        if (model.pimpl->lazy_load_async_in_progress && !model.pimpl->lazy_load_done) {
+            group.state = llama_model::impl::lazy_group_state::loading;
+            group.cv.wait(group_lock, [&] {
+                return group.state != llama_model::impl::lazy_group_state::loading;
+            });
+            if (group.state == llama_model::impl::lazy_group_state::ready) {
+                return true;
+            }
+            err_msg = group.error;
+            return false;
+        }
+        group.state = llama_model::impl::lazy_group_state::loading;
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(model.pimpl->lazy_load_mutex);
+
+        if (model.pimpl->lazy_load_failed) {
+            throw std::runtime_error(model.pimpl->lazy_load_error);
+        }
+
+        if (!model.pimpl->lazy_loader) {
+            // Eager load/no loader path: all weights are already usable.
+        } else {
+            if (!model.pimpl->lazy_alloc_done) {
+                prepare_lazy_allocations(model, timing_stats);
+            }
+            load_tensor_group_data(model, group, timing_stats);
+        }
+
+        {
+            std::lock_guard<std::mutex> group_lock(group.mutex);
+            group.state = llama_model::impl::lazy_group_state::ready;
+            group.error.clear();
+        }
+        group.cv.notify_all();
+        return true;
+    } catch (const std::exception & e) {
+        {
+            std::lock_guard<std::mutex> lock(model.pimpl->lazy_load_mutex);
+            model.pimpl->lazy_load_failed = true;
+            model.pimpl->lazy_load_error = e.what();
+        }
+        {
+            std::lock_guard<std::mutex> group_lock(group.mutex);
+            group.state = llama_model::impl::lazy_group_state::failed;
+            group.error = e.what();
+        }
+        group.cv.notify_all();
+        err_msg = e.what();
+        return false;
+    }
+}
+};
+
+bool llama_model::ensure_global_tensors_ready(std::string & err_msg) {
+    return llama_model_lazy_access::ensure_group_ready(*this, pimpl->lazy_global_group, err_msg);
+}
+
+bool llama_model::ensure_layer_tensors_ready(int il, std::string & err_msg) {
+    if (il < 0 || il >= (int) pimpl->lazy_layer_groups.size()) {
+        err_msg = format("layer index %d is out of range", il);
+        return false;
+    }
+    return llama_model_lazy_access::ensure_group_ready(*this, *pimpl->lazy_layer_groups[il], err_msg);
+}
+
+bool llama_model::ensure_output_tensors_ready(std::string & err_msg) {
+    return llama_model_lazy_access::ensure_group_ready(*this, pimpl->lazy_output_group, err_msg);
+}
+
 bool llama_model::ensure_tensors_ready(std::string & err_msg) {
     err_msg.clear();
 
@@ -9036,50 +9549,8 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
         return true;
     }
 
-    std::lock_guard<std::mutex> lock(pimpl->lazy_load_mutex);
-
     if (pimpl->lazy_load_done) {
-        if (!pimpl->lazy_loader) {
-            return true;
-        }
-
-        try {
-            llama_model_loader & ml = *pimpl->lazy_loader;
-            ml.init_mappings(true, params.use_mlock ? &pimpl->mlock_mmaps : nullptr);
-
-            std::unordered_map<ggml_context *, ggml_backend_buffer_type_t> ctx_buft_by_ptr;
-            ctx_buft_by_ptr.reserve(pimpl->lazy_ctx_buft.size());
-            for (const auto & [ctx, buft] : pimpl->lazy_ctx_buft) {
-                ctx_buft_by_ptr.emplace(ctx, buft);
-            }
-
-            for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
-                ggml_context * ctx = ctx_ptr.get();
-                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    if (t->view_src != nullptr || llama_tensor_has_backing_memory(t)) {
-                        continue;
-                    }
-
-                    auto it_buft = ctx_buft_by_ptr.find(ctx);
-                    if (it_buft == ctx_buft_by_ptr.end()) {
-                        throw std::runtime_error("internal error: missing buffer type for model context");
-                    }
-
-                    llama_ensure_tensor_allocated(ml, params.use_mlock, pimpl->mlock_mmaps, pimpl->mlock_bufs, ctx, it_buft->second, nullptr, bufs, t);
-                    llama_load_tensor_data(ml, params.use_mlock, pimpl->mlock_mmaps, t);
-                }
-
-                llama_refresh_tensor_views(ctx);
-                llama_refresh_weight_handles(ctx);
-            }
-
-            return true;
-        } catch (const std::exception & e) {
-            pimpl->lazy_load_failed = true;
-            pimpl->lazy_load_error = e.what();
-            err_msg = pimpl->lazy_load_error;
-            return false;
-        }
+        return true;
     }
 
     if (pimpl->lazy_load_failed) {
@@ -9092,86 +9563,24 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
         return true;
     }
 
+    llama_load_timing_stats timing_stats;
+    const uint64_t total_start_ns = params.load_micro_stats ? llama_time_now_ns() : 0;
+
     try {
-        llama_model_loader & ml = *pimpl->lazy_loader;
-        const bool use_mlock       = params.use_mlock;
-        llama_load_timing_stats timing_stats;
-        const uint64_t total_start_ns = params.load_micro_stats ? llama_time_now_ns() : 0;
+        llama_model_lazy_access::set_all_group_states(*this, impl::lazy_group_state::loading);
 
-        ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
-        pimpl->mappings.clear();
-        pimpl->mappings.reserve(ml.mappings.size());
-        pimpl->mlock_bufs.clear();
+        {
+            std::lock_guard<std::mutex> lock(pimpl->lazy_load_mutex);
 
-        std::unordered_map<ggml_context *, ggml_backend_buffer_type_t> ctx_buft_by_ptr;
-        ctx_buft_by_ptr.reserve(pimpl->lazy_ctx_buft.size());
-        for (const auto & [ctx, buft] : pimpl->lazy_ctx_buft) {
-            ctx_buft_by_ptr.emplace(ctx, buft);
-        }
-
-        std::unordered_map<ggml_context *, llama_buf_map *> ctx_buf_map_by_ptr;
-        ctx_buf_map_by_ptr.reserve(pimpl->lazy_ctx_buf_maps.size());
-        for (auto & [ctx, buf_map] : pimpl->lazy_ctx_buf_maps) {
-            ctx_buf_map_by_ptr.emplace(ctx, &buf_map);
-        }
-
-        for (auto & [ctx_ptr, bufs] : pimpl->ctxs_bufs) {
-            ggml_context * ctx = ctx_ptr.get();
-            if (ggml_get_first_tensor(ctx) == nullptr) {
-                continue;
+            if (pimpl->lazy_load_failed) {
+                throw std::runtime_error(pimpl->lazy_load_error);
             }
 
-            auto it_buft = ctx_buft_by_ptr.find(ctx);
-            if (it_buft == ctx_buft_by_ptr.end()) {
-                throw std::runtime_error("internal error: missing buffer type for model context");
-            }
-            ggml_backend_buffer_type_t buft = it_buft->second;
-
-            auto it_buf_map = ctx_buf_map_by_ptr.find(ctx);
-            if (it_buf_map == ctx_buf_map_by_ptr.end()) {
-                throw std::runtime_error("internal error: missing source buffer map for model context");
-            }
-            llama_buf_map & buf_map = *it_buf_map->second;
-            buf_map.clear();
-
-            // release placeholder buffers, then reset tensor pointers for re-allocation.
-            bufs.clear();
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                t->buffer        = nullptr;
-                t->weight_buffer = nullptr;
-                t->data          = nullptr;
+            if (!pimpl->lazy_alloc_done) {
+                llama_model_lazy_access::prepare_lazy_allocations(*this, params.load_micro_stats ? &timing_stats : nullptr);
             }
 
-            // 1) Allocate main tensors: strict 1:1 (one backend buffer per main tensor).
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                if (t->view_src != nullptr || t->buffer != nullptr || t->data != nullptr) {
-                    continue;
-                }
-
-                const uint64_t alloc_start_ns = params.load_micro_stats ? llama_time_now_ns() : 0;
-                llama_ensure_tensor_allocated(ml, use_mlock, pimpl->mlock_mmaps, pimpl->mlock_bufs, ctx, buft, &buf_map, bufs, t);
-                if (params.load_micro_stats) {
-                    timing_stats.alloc_ns += llama_time_now_ns() - alloc_start_ns;
-                }
-            }
-
-            // 2) Initialize views after their source tensors are allocated.
-            llama_refresh_tensor_views(ctx);
-
-            // Keep the explicit weight handle in sync for traversal/introspection.
-            llama_refresh_weight_handles(ctx);
-        }
-
-        if (!llama_load_all_tensor_data_per_tensor(
-                    ml,
-                    use_mlock,
-                    pimpl->mlock_mmaps,
-                    pimpl->ctxs_bufs,
-                    params.progress_callback,
-                    params.progress_callback_user_data,
-                    params.load_micro_stats ? &timing_stats : nullptr,
-                    params.async_io_load)) {
-            throw std::runtime_error("weight loading cancelled by progress callback");
+            llama_model_lazy_access::load_all_tensor_data(*this, params.load_micro_stats ? &timing_stats : nullptr);
         }
 
         // verify that all model tensors point to concrete memory.
@@ -9190,10 +9599,14 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
         }
 
         pimpl->lazy_load_done = true;
+        pimpl->lazy_load_async_in_progress = false;
+        llama_model_lazy_access::set_all_group_states(*this, impl::lazy_group_state::ready);
         return true;
     } catch (const std::exception & e) {
         pimpl->lazy_load_failed = true;
         pimpl->lazy_load_error = e.what();
+        pimpl->lazy_load_async_in_progress = false;
+        llama_model_lazy_access::set_all_group_states(*this, impl::lazy_group_state::failed, pimpl->lazy_load_error);
         err_msg = pimpl->lazy_load_error;
         return false;
     }
@@ -9595,6 +10008,15 @@ bool llama_model::unload_tensor(const char * name, std::string & err_msg, size_t
 
     if (bytes_freed != nullptr) {
         *bytes_freed = freed;
+    }
+
+    auto it_group = pimpl->lazy_tensor_to_group.find(tensor);
+    if (it_group != pimpl->lazy_tensor_to_group.end()) {
+        auto * group = it_group->second;
+        std::lock_guard<std::mutex> group_lock(group->mutex);
+        group->state = impl::lazy_group_state::unloaded;
+        group->error.clear();
+        pimpl->lazy_load_done = false;
     }
 
     return true;

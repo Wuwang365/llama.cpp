@@ -1171,6 +1171,59 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+struct llama_layerwise_weight_wait_cb {
+    llama_model * model;
+    bool output_ready = false;
+};
+
+static int llama_graph_node_layer(const char * name) {
+    const size_t len = std::strlen(name);
+    if (len < 3) {
+        return -1;
+    }
+
+    size_t pos = len;
+    while (pos > 0 && name[pos - 1] >= '0' && name[pos - 1] <= '9') {
+        --pos;
+    }
+    if (pos == len || pos == 0 || name[pos - 1] != '-') {
+        return -1;
+    }
+
+    int il = 0;
+    for (size_t i = pos; i < len; ++i) {
+        il = il * 10 + (name[i] - '0');
+    }
+    return il;
+}
+
+static bool llama_graph_node_uses_output_weights(const char * name) {
+    return std::strncmp(name, "result_norm", 11) == 0 ||
+           std::strncmp(name, "result_output", 13) == 0 ||
+           std::strncmp(name, "result_embd", 11) == 0;
+}
+
+static bool llama_layerwise_weight_wait(ggml_tensor * t, void * user_data) {
+    auto * cb = static_cast<llama_layerwise_weight_wait_cb *>(user_data);
+    std::string err_msg;
+
+    const int il = llama_graph_node_layer(ggml_get_name(t));
+    if (il >= 0) {
+        if (!cb->model->ensure_layer_tensors_ready(il, err_msg)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare layer %d tensors: %s\n", __func__, il, err_msg.c_str());
+            return false;
+        }
+    } else if (!cb->output_ready && llama_graph_node_uses_output_weights(ggml_get_name(t))) {
+        if (!cb->model->ensure_output_tensors_ready(err_msg)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare output tensors: %s\n", __func__, err_msg.c_str());
+            return false;
+        }
+        cb->output_ready = true;
+    }
+
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1231,7 +1284,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    llama_layerwise_weight_wait_cb wait_cb {
+        /*.model        =*/ const_cast<llama_model *>(&model),
+        /*.output_ready =*/ false,
+    };
+    ggml_backend_sched_set_pre_node_callback(sched.get(), llama_layerwise_weight_wait, &wait_cb);
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ggml_backend_sched_set_pre_node_callback(sched.get(), nullptr, nullptr);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1253,8 +1313,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     {
         std::string err_msg;
-        if (!const_cast<llama_model &>(model).ensure_tensors_ready(err_msg)) {
-            LLAMA_LOG_ERROR("%s: failed to prepare model tensors: %s\n", __func__, err_msg.c_str());
+        if (!const_cast<llama_model &>(model).ensure_global_tensors_ready(err_msg)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare global model tensors: %s\n", __func__, err_msg.c_str());
             return -3;
         }
     }
@@ -1556,8 +1616,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     {
         std::string err_msg;
-        if (!const_cast<llama_model &>(model).ensure_tensors_ready(err_msg)) {
-            LLAMA_LOG_ERROR("%s: failed to prepare model tensors: %s\n", __func__, err_msg.c_str());
+        if (!const_cast<llama_model &>(model).ensure_global_tensors_ready(err_msg)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare global model tensors: %s\n", __func__, err_msg.c_str());
             return -3;
         }
     }

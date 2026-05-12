@@ -590,6 +590,9 @@ struct llama_model {
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
     void start_async_tensors_load();
     void wait_async_tensors_load();
+    bool ensure_global_tensors_ready(std::string & err_msg);
+    bool ensure_layer_tensors_ready(int il, std::string & err_msg);
+    bool ensure_output_tensors_ready(std::string & err_msg);
     bool ensure_tensors_ready(std::string & err_msg);
     bool unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed = nullptr);
     bool is_tensor_loaded(const char * name) const;
@@ -635,6 +638,8 @@ struct llama_model {
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
 private:
+    friend struct llama_model_lazy_access;
+
     llama_model_params params;
 
     struct impl;

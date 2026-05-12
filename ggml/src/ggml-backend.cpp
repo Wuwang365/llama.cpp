@@ -812,6 +812,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    ggml_backend_sched_pre_node_callback callback_pre_node;
+    void * callback_pre_node_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1667,7 +1669,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (!sched->callback_eval && !sched->callback_pre_node) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1678,14 +1680,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
-                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                bool need = sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data);
 
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
                 while (!need && j1 < split->graph.n_nodes - 1) {
                     t = split->graph.nodes[++j1];
-                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    need = sched->callback_eval && sched->callback_eval(t, true, sched->callback_eval_user_data);
+                }
+
+                if (sched->callback_pre_node) {
+                    for (int j = j0; j <= j1; ++j) {
+                        if (!sched->callback_pre_node(split->graph.nodes[j], sched->callback_pre_node_user_data)) {
+                            return GGML_STATUS_ABORTED;
+                        }
+                    }
                 }
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
@@ -1911,6 +1921,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_pre_node_callback(ggml_backend_sched_t sched, ggml_backend_sched_pre_node_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_pre_node = callback;
+    sched->callback_pre_node_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
