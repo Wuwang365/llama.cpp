@@ -769,6 +769,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-simple-chat",
         "llama-speculative",
         "llama-speculative-simple",
+        "llama-switch-bench",
         "llama-tokenize",
         "llama-tts",
         "llama-vdot"

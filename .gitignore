@@ -140,6 +140,9 @@ poetry.toml
 /run-chat.sh
 /run-spec.sh
 /.ccache/
+/.codex
+/PLAN.md
+/bench-results/
 
 # IDE
 /*.code-workspace

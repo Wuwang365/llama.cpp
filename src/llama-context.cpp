@@ -11,7 +11,9 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1174,6 +1176,8 @@ bool llama_context::set_adapter_cvec(
 struct llama_layerwise_weight_wait_cb {
     llama_model * model;
     bool output_ready = false;
+    int n_layer = 0;
+    int prefetch_ahead = 0;
 };
 
 static int llama_graph_node_layer(const char * name) {
@@ -1212,6 +1216,13 @@ static bool llama_layerwise_weight_wait(ggml_tensor * t, void * user_data) {
         if (!cb->model->ensure_layer_tensors_ready(il, err_msg)) {
             LLAMA_LOG_ERROR("%s: failed to prepare layer %d tensors: %s\n", __func__, il, err_msg.c_str());
             return false;
+        }
+        for (int ahead = 1; ahead <= cb->prefetch_ahead; ++ahead) {
+            const int il_prefetch = il + ahead;
+            if (il_prefetch >= cb->n_layer) {
+                break;
+            }
+            cb->model->prefetch_layer_tensors(il_prefetch);
         }
     } else if (!cb->output_ready && llama_graph_node_uses_output_weights(ggml_get_name(t))) {
         if (!cb->model->ensure_output_tensors_ready(err_msg)) {
@@ -1287,6 +1298,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     llama_layerwise_weight_wait_cb wait_cb {
         /*.model        =*/ const_cast<llama_model *>(&model),
         /*.output_ready =*/ false,
+        /*.n_layer      =*/ (int) model.hparams.n_layer,
+        /*.prefetch_ahead =*/ std::max(0, std::atoi(std::getenv("LLAMA_WEIGHT_PREFETCH_AHEAD") ? std::getenv("LLAMA_WEIGHT_PREFETCH_AHEAD") : "0")),
     };
     ggml_backend_sched_set_pre_node_callback(sched.get(), llama_layerwise_weight_wait, &wait_cb);
 
@@ -1621,6 +1634,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             return -3;
         }
     }
+
+    const_cast<llama_model &>(model).prefetch_unloaded_tensors();
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;

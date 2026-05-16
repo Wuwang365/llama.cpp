@@ -18,6 +18,24 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
+struct llama_weight_load_metrics {
+    uint64_t ready_wall_ns   = 0;
+    uint64_t wait_ns         = 0;
+    uint64_t alloc_ns        = 0;
+    uint64_t read_wall_ns    = 0;
+    uint64_t read_sum_ns     = 0;
+    uint64_t upload_wait_ns  = 0;
+    uint64_t upload_set_ns   = 0;
+    uint64_t upload_sync_ns  = 0;
+    size_t   read_bytes      = 0;
+    size_t   upload_bytes    = 0;
+    size_t   upload_batches  = 0;
+    size_t   n_tensors       = 0;
+    size_t   n_io_queues     = 0;
+    size_t   n_groups_ready  = 0;
+    size_t   n_groups_loaded = 0;
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -590,9 +608,15 @@ struct llama_model {
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
     void start_async_tensors_load();
     void wait_async_tensors_load();
+    void reset_weight_load_metrics();
+    void add_weight_load_metrics(const llama_weight_load_metrics & metrics);
+    llama_weight_load_metrics get_weight_load_metrics() const;
     bool ensure_global_tensors_ready(std::string & err_msg);
     bool ensure_layer_tensors_ready(int il, std::string & err_msg);
     bool ensure_output_tensors_ready(std::string & err_msg);
+    void prefetch_layer_tensors(int il);
+    void prefetch_output_tensors();
+    void prefetch_unloaded_tensors();
     bool ensure_tensors_ready(std::string & err_msg);
     bool unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed = nullptr);
     bool is_tensor_loaded(const char * name) const;
