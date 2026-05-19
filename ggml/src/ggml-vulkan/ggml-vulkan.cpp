@@ -13736,6 +13736,14 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
 
     auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
+    const char * direct_set = getenv("LLAMA_VK_HOST_VISIBLE_DIRECT_SET");
+    if (direct_set != nullptr && strcmp(direct_set, "0") != 0 &&
+            (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        memcpy((uint8_t *) buf->ptr + dst_offset, data, size);
+        return;
+    }
+
     bool ret = ggml_vk_buffer_write_async(cpy_ctx, buf, dst_offset, data, size);
 
     if (!ret) {

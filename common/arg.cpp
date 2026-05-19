@@ -2226,6 +2226,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MMAP"));
     add_opt(common_arg(
+        {"--parallel-load"},
+        {"--no-parallel-load"},
+        string_format("whether to enable background-capable model weight loading/restoring. (default: %s)", params.parallel_load ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.parallel_load = value;
+        }
+    ).set_env("LLAMA_ARG_PARALLEL_LOAD"));
+    add_opt(common_arg(
+        {"--async-io-load"},
+        {"--no-async-io-load"},
+        string_format("whether to use explicit async IO queues for non-mmap model weight loading. (default: %s)", params.async_io_load ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.async_io_load = value;
+        }
+    ).set_env("LLAMA_ARG_ASYNC_IO_LOAD"));
+    add_opt(common_arg(
+        {"--load-micro-stats"},
+        {"--no-load-micro-stats"},
+        string_format("whether to print fine-grained model weight load/restore timings. (default: %s)", params.load_micro_stats ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.load_micro_stats = value;
+        }
+    ).set_env("LLAMA_ARG_LOAD_MICRO_STATS"));
+    add_opt(common_arg(
+        {"--unload-all-after-load"},
+        "unload all unloadable model weights after initial load and before serving/running",
+        [](common_params & params) {
+            params.unload_all_after_load = true;
+        }
+    ).set_env("LLAMA_ARG_UNLOAD_ALL_AFTER_LOAD"));
+    add_opt(common_arg(
+        {"--unload-after-load-fraction"}, "F",
+        "unload approximately this fraction of model weight bytes after initial load",
+        [](common_params & params, const std::string & value) {
+            params.unload_after_load_fraction = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_UNLOAD_AFTER_LOAD_FRACTION"));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),

@@ -135,6 +135,32 @@ struct llama_file::impl {
         }
     }
 
+    void read_raw_at(size_t offset, void * ptr, size_t len) const {
+        if (len == 0) {
+            return;
+        }
+
+        size_t bytes_read = 0;
+        while (bytes_read < len) {
+            const size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
+            DWORD chunk_read = 0;
+            OVERLAPPED ov = {};
+            const uint64_t pos = (uint64_t) offset + bytes_read;
+            ov.Offset     = (DWORD) (pos & 0xffffffffu);
+            ov.OffsetHigh = (DWORD) (pos >> 32);
+
+            BOOL result = ReadFile(fp_win32, reinterpret_cast<char *>(ptr) + bytes_read, chunk_size, &chunk_read, &ov);
+            if (!result) {
+                throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+            }
+            if (chunk_read < chunk_size || chunk_read == 0) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+
+            bytes_read += chunk_read;
+        }
+    }
+
     uint32_t read_u32() {
         uint32_t val;
         read_raw(&val, sizeof(val));
@@ -308,6 +334,59 @@ struct llama_file::impl {
         }
     }
 
+    void read_raw_at(size_t offset, void * ptr, size_t len) const {
+        if (len == 0) {
+            return;
+        }
+
+        if (fd != -1) {
+            size_t bytes_read = 0;
+            while (bytes_read < len) {
+                const size_t to_read = len - bytes_read;
+                ssize_t ret = pread(fd, reinterpret_cast<char *>(ptr) + bytes_read, to_read, (off_t) (offset + bytes_read));
+
+                if (ret == -1) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    throw std::runtime_error(format("pread error: %s", strerror(errno)));
+                }
+                if (ret == 0) {
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+
+                bytes_read += (size_t) ret;
+            }
+            return;
+        }
+
+        long pos_prev = std::ftell(fp);
+        if (pos_prev == -1) {
+            throw std::runtime_error(format("ftell error: %s", strerror(errno)));
+        }
+
+        if (std::fseek(fp, (long) offset, SEEK_SET) == -1) {
+            throw std::runtime_error(format("seek error: %s", strerror(errno)));
+        }
+
+        try {
+            const size_t ret = std::fread(ptr, len, 1, fp);
+            if (ferror(fp)) {
+                throw std::runtime_error(format("read error: %s", strerror(errno)));
+            }
+            if (len > 0 && ret != 1) {
+                throw std::runtime_error("unexpectedly reached end of file");
+            }
+        } catch (...) {
+            std::fseek(fp, pos_prev, SEEK_SET);
+            throw;
+        }
+
+        if (std::fseek(fp, pos_prev, SEEK_SET) == -1) {
+            throw std::runtime_error(format("seek restore error: %s", strerror(errno)));
+        }
+    }
+
     void read_aligned_chunk(void * dest, size_t size) {
         size_t offset = tell();
         off_t aligned_offset = offset & ~(alignment - 1);
@@ -417,6 +496,7 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file::read_raw_at(size_t offset, void * ptr, size_t len) const { pimpl->read_raw_at(offset, ptr, len); }
 #ifdef _WIN32
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else

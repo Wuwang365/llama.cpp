@@ -812,6 +812,9 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    bool callback_eval_sync;
+    ggml_backend_sched_pre_node_callback callback_pre_node;
+    void * callback_pre_node_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1667,7 +1670,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (!sched->callback_eval && !sched->callback_pre_node) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -1678,14 +1681,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
-                bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                bool need = sched->callback_eval ? sched->callback_eval(t, true, sched->callback_eval_user_data) : false;
 
                 int j1 = j0;
 
                 // determine the range [j0, j1] of nodes that can be computed together
                 while (!need && j1 < split->graph.n_nodes - 1) {
                     t = split->graph.nodes[++j1];
-                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    need = sched->callback_eval ? sched->callback_eval(t, true, sched->callback_eval_user_data) : false;
+                }
+
+                if (sched->callback_pre_node) {
+                    for (int j = j0; j <= j1; ++j) {
+                        if (!sched->callback_pre_node(split->graph.nodes[j], sched->callback_pre_node_user_data)) {
+                            return GGML_STATUS_ABORTED;
+                        }
+                    }
                 }
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
@@ -1695,8 +1706,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     return ec;
                 }
 
-                // TODO: pass backend to the callback, then the user can decide if they want to synchronize
-                ggml_backend_synchronize(split_backend);
+                // TODO: pass backend to the callback, then the user can decide if they want to synchronize.
+                // Some callbacks only use the eval boundary to split command submission and do not read data.
+                if (need && sched->callback_eval_sync) {
+                    ggml_backend_synchronize(split_backend);
+                }
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -1742,6 +1756,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->callback_eval_sync = true;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -1911,6 +1926,18 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+    sched->callback_eval_sync = true;
+}
+
+void ggml_backend_sched_set_eval_callback_sync(ggml_backend_sched_t sched, bool synchronize) {
+    GGML_ASSERT(sched);
+    sched->callback_eval_sync = synchronize;
+}
+
+void ggml_backend_sched_set_pre_node_callback(ggml_backend_sched_t sched, ggml_backend_sched_pre_node_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_pre_node = callback;
+    sched->callback_pre_node_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
@@ -1978,6 +2005,7 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor->view_src->data != NULL);
 
     tensor->buffer = tensor->view_src->buffer;
+    tensor->weight_buffer = nullptr;
     tensor->data = (char *)tensor->view_src->data + tensor->view_offs;
     return ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
 }
@@ -1993,6 +2021,7 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct 
         (char *) ggml_backend_buffer_get_base(buffer) + ggml_backend_buffer_get_size(buffer));
 
     tensor->buffer = buffer;
+    tensor->weight_buffer = ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? buffer : nullptr;
     tensor->data = addr;
     return ggml_backend_buffer_init_tensor(buffer, tensor);
 }

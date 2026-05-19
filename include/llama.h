@@ -319,6 +319,9 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool parallel_load;    // preload or restore weights on a background-capable path
+        bool async_io_load;    // use explicit async IO queues for non-mmap weight loading
+        bool load_micro_stats; // print fine-grained weight loading timing statistics
     };
 
     struct llama_sampler_seq_config {
@@ -498,6 +501,69 @@ extern "C" {
             "use llama_model_free instead");
 
     LLAMA_API void llama_model_free(struct llama_model * model);
+
+    LLAMA_API bool llama_model_unload_all_tensors(
+            struct llama_model * model,
+                        size_t * bytes_freed,
+                        size_t * tensors_unloaded);
+
+    LLAMA_API bool llama_model_unload_tensor_fraction(
+            struct llama_model * model,
+                         float   fraction,
+                        size_t * bytes_freed,
+                        size_t * tensors_unloaded,
+                        size_t * bytes_considered);
+
+    LLAMA_API bool llama_model_unload_tensor(
+            struct llama_model * model,
+                  const char * name,
+                        size_t * bytes_freed);
+
+    LLAMA_API bool llama_model_is_tensor_loaded(
+            const struct llama_model * model,
+                  const char * name);
+
+    LLAMA_API bool llama_model_ensure_tensors_ready(struct llama_model * model);
+    LLAMA_API void llama_model_prefetch_unloaded_tensors(struct llama_model * model);
+    LLAMA_API void llama_model_start_async_tensors_load(struct llama_model * model);
+    LLAMA_API void llama_model_wait_async_tensors_load(struct llama_model * model);
+    LLAMA_API uint64_t llama_model_weight_epoch(const struct llama_model * model);
+
+    struct llama_model_weight_load_metrics {
+        int64_t ready_us;
+        int64_t alloc_us;
+        int64_t read_wall_us;
+        int64_t read_worker_us;
+        int64_t upload_set_us;
+        int64_t upload_sync_us;
+        uint64_t read_bytes;
+        uint64_t upload_bytes;
+        uint64_t upload_batches;
+        uint64_t queue_count;
+        uint64_t tensor_count;
+        uint64_t reload_group_count;
+    };
+
+    LLAMA_API bool llama_model_weight_last_load_metrics(
+            const struct llama_model * model,
+            struct llama_model_weight_load_metrics * metrics);
+
+    LLAMA_API int32_t llama_model_weight_count(const struct llama_model * model);
+
+    // Returns the number of bytes that would have been written, excluding the terminating null byte.
+    LLAMA_API int32_t llama_model_weight_name_by_index(
+            const struct llama_model * model,
+                         int32_t       i,
+                            char * buf,
+                          size_t   buf_size);
+
+    // layer is -1 for global tensors and INT32_MAX for output tensors.
+    LLAMA_API bool llama_model_weight_info_by_index(
+            const struct llama_model * model,
+                         int32_t       i,
+                          size_t * nbytes,
+                         int32_t * layer,
+                            bool * loaded);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,

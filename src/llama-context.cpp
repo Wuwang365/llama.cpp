@@ -13,13 +13,28 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 //
 // llama_context
 //
+
+static bool llama_context_weight_pre_node_callback(ggml_tensor * node, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    std::string err;
+    auto & model = const_cast<llama_model &>(lctx->get_model());
+    if (!model.ensure_node_tensors_ready(node, err)) {
+        LLAMA_LOG_ERROR("%s: failed to prepare weights before node '%s': %s\n",
+                __func__, node ? ggml_get_name(node) : "(null)", err.c_str());
+        return false;
+    }
+    return true;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -629,6 +644,30 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+bool llama_context::sync_model_weight_epoch() {
+    const uint64_t cur = model.weight_epoch();
+    if (cur == weight_epoch_seen) {
+        return true;
+    }
+
+    LLAMA_LOG_INFO("%s: model weight epoch changed from %llu to %llu; synchronizing scheduler\n",
+            __func__, (unsigned long long) weight_epoch_seen, (unsigned long long) cur);
+
+    synchronize();
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+    if (gf_res_reserve) {
+        gf_res_reserve->reset();
+    }
+    sched_need_reserve = true;
+    weight_epoch_seen = cur;
+    return true;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -1168,6 +1207,254 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+struct llama_layerwise_weight_wait_cb {
+    llama_model * model = nullptr;
+    bool output_ready = false;
+    bool debug = false;
+    int n_layer = 0;
+    std::vector<char> layer_ready;
+    std::unordered_map<ggml_tensor *, int> layer_barriers;
+    std::unordered_set<ggml_tensor *> output_barriers;
+    ggml_backend_sched_eval_callback user_eval = nullptr;
+    void * user_eval_user_data = nullptr;
+    std::unordered_map<ggml_tensor *, bool> user_eval_needed;
+};
+
+static int llama_graph_node_layer(const char * name) {
+    const size_t len = std::strlen(name);
+    if (len < 3) {
+        return -1;
+    }
+
+    size_t pos = len;
+    while (pos > 0 && name[pos - 1] >= '0' && name[pos - 1] <= '9') {
+        --pos;
+    }
+    if (pos == len || pos == 0 || name[pos - 1] != '-') {
+        return -1;
+    }
+
+    int il = 0;
+    for (size_t i = pos; i < len; ++i) {
+        il = il * 10 + (name[i] - '0');
+    }
+    return il;
+}
+
+static bool llama_graph_node_uses_output_weights(const char * name) {
+    return std::strncmp(name, "result_norm", 11) == 0 ||
+           std::strncmp(name, "result_output", 13) == 0 ||
+           std::strncmp(name, "result_embd", 11) == 0;
+}
+
+static bool llama_layerwise_weight_wait(ggml_tensor * t, void * user_data) {
+    auto * cb = static_cast<llama_layerwise_weight_wait_cb *>(user_data);
+    if (cb == nullptr || cb->model == nullptr || t == nullptr) {
+        return true;
+    }
+
+    std::string err_msg;
+    const int il = llama_graph_node_layer(ggml_get_name(t));
+    if (il >= 0) {
+        bool already_ready = false;
+        if (il < (int) cb->layer_ready.size()) {
+            already_ready = cb->layer_ready[il] != 0;
+        }
+        if (!already_ready) {
+            if (!cb->model->ensure_layer_tensors_ready(il, err_msg)) {
+                LLAMA_LOG_ERROR("%s: failed to prepare layer %d tensors: %s\n", __func__, il, err_msg.c_str());
+                return false;
+            }
+            if (il < (int) cb->layer_ready.size()) {
+                cb->layer_ready[il] = 1;
+            }
+        }
+    } else if (!cb->output_ready && llama_graph_node_uses_output_weights(ggml_get_name(t))) {
+        if (!cb->model->ensure_output_tensors_ready(err_msg)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare output tensors: %s\n", __func__, err_msg.c_str());
+            return false;
+        }
+        cb->output_ready = true;
+    }
+
+    return true;
+}
+
+static bool llama_layerwise_weight_eval_boundary(ggml_tensor * t, bool ask, void * user_data) {
+    auto * cb = static_cast<llama_layerwise_weight_wait_cb *>(user_data);
+    if (cb == nullptr) {
+        return true;
+    }
+
+    if (ask) {
+        const bool user_need = cb->user_eval && cb->user_eval(t, true, cb->user_eval_user_data);
+        if (user_need) {
+            cb->user_eval_needed[t] = true;
+        }
+        return user_need ||
+            cb->layer_barriers.find(t) != cb->layer_barriers.end() ||
+            cb->output_barriers.find(t) != cb->output_barriers.end();
+    }
+
+    auto it = cb->user_eval_needed.find(t);
+    if (it == cb->user_eval_needed.end() || !it->second) {
+        return true;
+    }
+
+    cb->user_eval_needed.erase(it);
+    return cb->user_eval(t, false, cb->user_eval_user_data);
+}
+
+static void llama_insert_layer_barrier(
+        const std::vector<ggml_tensor *> & last_layer_node,
+        int run_start,
+        int target_layer,
+        std::unordered_map<ggml_tensor *, int> & barriers) {
+    for (int il = target_layer; il >= run_start; --il) {
+        if (il >= 0 && il < (int) last_layer_node.size() && last_layer_node[il] != nullptr) {
+            barriers[last_layer_node[il]] = target_layer;
+            return;
+        }
+    }
+}
+
+static std::unordered_set<int> llama_collect_unready_layers(
+        const std::vector<int> & unready_layers,
+        int n_layer) {
+    std::unordered_set<int> result;
+    result.reserve(unready_layers.size());
+    for (const int il : unready_layers) {
+        if (il >= 0 && il < n_layer) {
+            result.insert(il);
+        }
+    }
+    return result;
+}
+
+static int llama_env_i32(const char * name, int fallback, int lo, int hi) {
+    const char * value = std::getenv(name);
+    if (value && value[0]) {
+        char * end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (end != value) {
+            fallback = (int) parsed;
+        }
+    }
+    return std::min(std::max(fallback, lo), hi);
+}
+
+static std::unordered_map<ggml_tensor *, int> llama_build_layerwise_weight_barriers(
+        ggml_cgraph * gf,
+        int n_layer,
+        const std::vector<int> & unready_layers) {
+    std::vector<ggml_tensor *> last_layer_node(std::max(0, n_layer), nullptr);
+    const bool debug = llama_env_i32("LLAMA_WEIGHT_WAIT_DEBUG", 0, 0, 1) != 0;
+    const int barrier_target = llama_env_i32("LLAMA_WEIGHT_BARRIER_TARGET", 8, 1, 1024);
+    const int barrier_stride = llama_env_i32("LLAMA_WEIGHT_BARRIER_STRIDE", barrier_target, 1, 1024);
+    const auto unready = llama_collect_unready_layers(unready_layers, n_layer);
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const int il = llama_graph_node_layer(ggml_get_name(node));
+        if (il >= 0 && il < n_layer) {
+            last_layer_node[il] = node;
+        }
+    }
+
+    std::unordered_map<ggml_tensor *, int> barriers;
+    if (unready.empty()) {
+        return barriers;
+    }
+
+    if (llama_env_i32("LLAMA_WEIGHT_PREFIX_BARRIER", 1, 0, 1) != 0) {
+        int first_unready = n_layer;
+        for (int il = 0; il < n_layer; ++il) {
+            if (unready.find(il) != unready.end()) {
+                first_unready = il;
+                break;
+            }
+        }
+
+        if (first_unready > 0 && first_unready <= n_layer) {
+            llama_insert_layer_barrier(last_layer_node, 0, first_unready - 1, barriers);
+            if (debug) {
+                LLAMA_LOG_INFO("%s: selected prefix layer barrier before first unready layer %d\n",
+                        __func__, first_unready);
+            }
+            return barriers;
+        }
+    }
+
+    int total_unready = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        if (unready.find(il) != unready.end()) {
+            ++total_unready;
+        }
+    }
+
+    const int chunk_unready = barrier_stride;
+
+    int run_start = -1;
+    int in_chunk = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        const bool is_unready = unready.find(il) != unready.end();
+        if (is_unready) {
+            if (run_start < 0) {
+                run_start = il;
+            }
+            ++in_chunk;
+        }
+
+        const bool run_ends = run_start >= 0 && (!is_unready || il + 1 == n_layer);
+        const int run_end = is_unready ? il : il - 1;
+        if (is_unready && in_chunk >= chunk_unready) {
+            llama_insert_layer_barrier(last_layer_node, run_start, il, barriers);
+            in_chunk = 0;
+        }
+        if (run_ends) {
+            if (in_chunk > 0) {
+                llama_insert_layer_barrier(last_layer_node, run_start, run_end, barriers);
+            }
+            run_start = -1;
+            in_chunk = 0;
+        }
+    }
+
+    if (debug) {
+        LLAMA_LOG_INFO("%s: selected %zu layer barriers from %d graph nodes, unready_layers=%d, target=%d, stride=%d\n",
+                __func__, barriers.size(), n_nodes, total_unready, barrier_target, barrier_stride);
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            auto it = barriers.find(node);
+            if (it != barriers.end()) {
+                LLAMA_LOG_INFO("%s: layer barrier node[%d] '%s' target_layer=%d\n",
+                        __func__, i, ggml_get_name(node), it->second);
+            }
+        }
+    }
+    return barriers;
+}
+
+static std::unordered_set<ggml_tensor *> llama_build_output_weight_barriers(
+        ggml_cgraph * gf,
+        bool output_unready) {
+    std::unordered_set<ggml_tensor *> barriers;
+    if (!output_unready) {
+        return barriers;
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (llama_graph_node_uses_output_weights(ggml_get_name(node))) {
+            barriers.insert(node);
+            return barriers;
+        }
+    }
+    return barriers;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1228,7 +1515,37 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    llama_layerwise_weight_wait_cb wait_cb;
+    const bool need_weight_wait = model.has_unready_tensors();
+    if (need_weight_wait) {
+        const std::vector<int> unready_layers = model.unready_layer_indices();
+        const bool output_unready = !model.output_tensors_ready();
+
+        wait_cb.model = const_cast<llama_model *>(&model);
+        wait_cb.debug = llama_env_i32("LLAMA_WEIGHT_WAIT_DEBUG", 0, 0, 1) != 0;
+        wait_cb.n_layer = (int) model.hparams.n_layer;
+        wait_cb.layer_ready.assign(std::max(0, wait_cb.n_layer), 0);
+        wait_cb.layer_barriers = llama_build_layerwise_weight_barriers(res->get_gf(), wait_cb.n_layer, unready_layers);
+        const bool prefix_barrier = llama_env_i32("LLAMA_WEIGHT_PREFIX_BARRIER", 1, 0, 1) != 0 && wait_cb.layer_barriers.size() == 1;
+        wait_cb.output_barriers = llama_build_output_weight_barriers(res->get_gf(), output_unready && !prefix_barrier);
+        wait_cb.user_eval = cparams.cb_eval;
+        wait_cb.user_eval_user_data = cparams.cb_eval_user_data;
+
+        ggml_backend_sched_set_eval_callback(sched.get(), llama_layerwise_weight_eval_boundary, &wait_cb);
+        ggml_backend_sched_set_eval_callback_sync(sched.get(), cparams.cb_eval != nullptr);
+        ggml_backend_sched_set_pre_node_callback(sched.get(), llama_layerwise_weight_wait, &wait_cb);
+        if (wait_cb.debug) {
+            LLAMA_LOG_INFO("%s: installed layerwise wait callbacks, layer_barriers=%zu, output_barriers=%zu, unready_layers=%zu, output_unready=%d\n",
+                    __func__, wait_cb.layer_barriers.size(), wait_cb.output_barriers.size(), unready_layers.size(), output_unready ? 1 : 0);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (need_weight_wait) {
+        ggml_backend_sched_set_pre_node_callback(sched.get(), nullptr, nullptr);
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback_sync(sched.get(), true);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1274,6 +1591,22 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
+
+    if (model.weight_epoch() != weight_epoch_seen) {
+        sync_model_weight_epoch();
+    }
+    {
+        std::string err;
+        auto & mutable_model = const_cast<llama_model &>(model);
+        if (!mutable_model.ensure_global_tensors_ready(err)) {
+            LLAMA_LOG_ERROR("%s: failed to restore global weights: %s\n", __func__, err.c_str());
+            return -3;
+        }
+        mutable_model.prefetch_unloaded_tensors();
+    }
+    if (model.weight_epoch() != weight_epoch_seen) {
+        sync_model_weight_epoch();
+    }
 
     sched_reserve();
 
@@ -1608,6 +1941,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
     output_swaps.clear();
+
+    if (model.weight_epoch() != weight_epoch_seen) {
+        sync_model_weight_epoch();
+    }
+    {
+        std::string err;
+        auto & mutable_model = const_cast<llama_model &>(model);
+        if (!mutable_model.ensure_global_tensors_ready(err)) {
+            LLAMA_LOG_ERROR("%s: failed to restore global weights: %s\n", __func__, err.c_str());
+            return -3;
+        }
+        mutable_model.prefetch_unloaded_tensors();
+    }
+    if (model.weight_epoch() != weight_epoch_seen) {
+        sync_model_weight_epoch();
+    }
 
     sched_reserve();
 

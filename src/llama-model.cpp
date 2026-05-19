@@ -23,17 +23,25 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cfloat>
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -572,6 +580,19 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
 
+    const char * vk_weight_host_buffer = std::getenv("LLAMA_VK_WEIGHT_HOST_BUFFER");
+    if (vk_weight_host_buffer != nullptr && std::atoi(vk_weight_host_buffer) != 0) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft != nullptr) {
+            LLAMA_LOG_INFO("%s: LLAMA_VK_WEIGHT_HOST_BUFFER=1, preferring %s for GPU weights on %s\n",
+                    __func__, ggml_backend_buft_name(host_buft), ggml_backend_dev_name(dev));
+            buft_list.emplace_back(dev, host_buft);
+        } else {
+            LLAMA_LOG_WARN("%s: LLAMA_VK_WEIGHT_HOST_BUFFER=1 ignored: device %s has no host buffer type\n",
+                    __func__, ggml_backend_dev_name(dev));
+        }
+    }
+
     // add the device split buffer type if requested and available
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -617,7 +638,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        if (lazy_load_thread.joinable()) {
+            lazy_load_thread.join();
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -634,6 +659,57 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+
+    enum class weight_state {
+        unloaded,
+        loading,
+        staged,
+        submitted,
+        ready,
+        failed,
+    };
+
+    struct weight_restore_metrics {
+        int64_t ready_us = 0;
+        int64_t alloc_us = 0;
+        int64_t read_wall_us = 0;
+        int64_t read_worker_us = 0;
+        int64_t upload_set_us = 0;
+        int64_t upload_sync_us = 0;
+        size_t read_bytes = 0;
+        size_t upload_bytes = 0;
+        size_t upload_batches = 0;
+        size_t queue_count = 0;
+        size_t tensor_count = 0;
+        size_t reload_group_count = 0;
+    };
+
+    struct weight_record {
+        std::string name;
+        ggml_tensor * tensor = nullptr;
+        std::vector<ggml_tensor *> views;
+        uint16_t file_idx = 0;
+        size_t file_offs = 0;
+        size_t nbytes = 0;
+        ggml_backend_buffer_type_t buft = nullptr;
+        size_t ctx_index = 0;
+        int layer = -1; // -1 global, >=0 layer, INT_MAX output
+        weight_state state = weight_state::ready;
+        std::string error;
+    };
+
+    mutable std::mutex weight_mutex;
+    std::condition_variable weight_cv;
+    std::atomic<uint64_t> weight_epoch_value{0};
+    std::vector<weight_record> weight_records;
+    std::unordered_map<std::string, size_t> weight_by_name;
+    std::unordered_map<ggml_tensor *, size_t> weight_by_tensor;
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr, llama_model_loader::ggml_backend_buft_comparator> weight_placeholders;
+    std::vector<std::string> weight_file_paths;
+    bool weight_use_direct_io = false;
+    bool weight_micro_stats = false;
+    std::thread lazy_load_thread;
+    weight_restore_metrics last_weight_metrics;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -657,6 +733,70 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
+    }
+}
+
+static int llama_weight_layer_for_name(const std::string & name) {
+    int layer = -1;
+    if (sscanf(name.c_str(), "blk.%d.", &layer) == 1) {
+        return layer;
+    }
+    if (name == "output.weight" || name == "output.bias" || name.rfind("output_", 0) == 0) {
+        return INT_MAX;
+    }
+    return -1;
+}
+
+static bool llama_tensor_name_matches_env_regex(const char * env_name, const std::string & tensor_name) {
+    const char * pattern = getenv(env_name);
+    if (!pattern || !pattern[0]) {
+        return false;
+    }
+
+    try {
+        return std::regex_search(tensor_name, std::regex(pattern));
+    } catch (const std::regex_error & err) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            LLAMA_LOG_WARN("%s: ignoring invalid regex in %s: %s\n", __func__, env_name, err.what());
+        });
+        return false;
+    }
+}
+
+static int llama_env_i32(const char * name, int fallback, int lo, int hi) {
+    const char * value = getenv(name);
+    if (value && value[0]) {
+        char * end = nullptr;
+        long parsed = strtol(value, &end, 10);
+        if (end != value) {
+            fallback = (int) parsed;
+        }
+    }
+    return std::max(lo, std::min(hi, fallback));
+}
+
+static bool llama_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    if (!value || !value[0]) {
+        return false;
+    }
+    return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+}
+
+static void llama_weight_test_wait_file_gate() {
+    const char * path = getenv("LLAMA_WEIGHT_TEST_WAIT_FILE");
+    if (!path || !path[0]) {
+        return;
+    }
+
+    while (true) {
+        FILE * f = fopen(path, "rb");
+        if (!f) {
+            return;
+        }
+        fclose(f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
 
@@ -8106,6 +8246,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
+    const bool per_tensor_weight_buffers = !ml.use_mmap && !ml.no_alloc && (params.parallel_load || params.async_io_load);
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
 
@@ -8159,6 +8300,36 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+            }
+        } else if (per_tensor_weight_buffers) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->view_src != nullptr) {
+                    continue;
+                }
+
+                const size_t size = ggml_backend_buft_get_alloc_size(buft, t);
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer for tensor %s", ggml_backend_buft_name(buft), ggml_get_name(t)));
+                }
+
+                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf));
+
+                if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+                    pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                    auto & mlock_buf = pimpl->mlock_bufs.back();
+                    mlock_buf->init   (ggml_backend_buffer_get_base(buf));
+                    mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+                }
+
+                bufs.emplace_back(buf);
+            }
+
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->view_src != nullptr) {
+                    ggml_backend_view_init(t);
+                }
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -8237,6 +8408,1040 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        pimpl->weight_records.clear();
+        pimpl->weight_by_name.clear();
+        pimpl->weight_by_tensor.clear();
+        pimpl->weight_placeholders.clear();
+        pimpl->weight_file_paths = ml.file_paths;
+        pimpl->weight_use_direct_io = ml.use_direct_io;
+        pimpl->weight_micro_stats = params.load_micro_stats;
+
+        for (size_t ctx_index = 0; ctx_index < pimpl->ctxs_bufs.size(); ++ctx_index) {
+            auto * ctx = pimpl->ctxs_bufs[ctx_index].first.get();
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->view_src != nullptr) {
+                    continue;
+                }
+
+                const char * name = ggml_get_name(t);
+                const auto * weight = ml.get_weight(name);
+                if (!weight) {
+                    continue;
+                }
+
+                impl::weight_record rec;
+                rec.name = name;
+                rec.tensor = t;
+                rec.file_idx = weight->idx;
+                rec.file_offs = weight->offs;
+                rec.nbytes = ggml_nbytes(t);
+                rec.buft = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
+                rec.ctx_index = ctx_index;
+                rec.layer = llama_weight_layer_for_name(rec.name);
+                rec.state = impl::weight_state::ready;
+
+                const size_t index = pimpl->weight_records.size();
+                pimpl->weight_by_name.emplace(rec.name, index);
+                pimpl->weight_by_tensor.emplace(t, index);
+                pimpl->weight_records.emplace_back(std::move(rec));
+            }
+        }
+
+        for (size_t ctx_index = 0; ctx_index < pimpl->ctxs_bufs.size(); ++ctx_index) {
+            auto * ctx = pimpl->ctxs_bufs[ctx_index].first.get();
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->view_src == nullptr) {
+                    continue;
+                }
+                auto it = pimpl->weight_by_tensor.find(t->view_src);
+                if (it != pimpl->weight_by_tensor.end()) {
+                    pimpl->weight_records[it->second].views.push_back(t);
+                }
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: weight residency manager registered %zu tensors (%s)\n",
+                __func__, pimpl->weight_records.size(), per_tensor_weight_buffers ? "per-tensor buffers" : "shared buffers");
+    }
+
+    return true;
+}
+
+bool llama_model::unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed) {
+    if (bytes_freed) {
+        *bytes_freed = 0;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+
+    auto it = pimpl->weight_by_name.find(name ? name : "");
+    if (it == pimpl->weight_by_name.end()) {
+        err_msg = format("unknown tensor '%s'", name ? name : "");
+        return false;
+    }
+
+    auto & rec = pimpl->weight_records[it->second];
+    if (rec.state == impl::weight_state::unloaded) {
+        err_msg = format("tensor '%s' is already unloaded", rec.name.c_str());
+        return false;
+    }
+    if (rec.state == impl::weight_state::loading ||
+        rec.state == impl::weight_state::staged ||
+        rec.state == impl::weight_state::submitted) {
+        err_msg = format("tensor '%s' is currently loading", rec.name.c_str());
+        return false;
+    }
+    if (rec.tensor->view_src != nullptr) {
+        err_msg = format("tensor '%s' is a view and cannot be unloaded independently", rec.name.c_str());
+        return false;
+    }
+    if (rec.file_idx >= pimpl->weight_file_paths.size() || pimpl->weight_file_paths[rec.file_idx].empty()) {
+        err_msg = format("tensor '%s' cannot be restored because its source file path is unavailable", rec.name.c_str());
+        return false;
+    }
+
+    ggml_backend_buffer_t old_buf = rec.tensor->weight_buffer;
+    if (old_buf == nullptr || rec.tensor->data == nullptr) {
+        err_msg = format("tensor '%s' is already unloaded", rec.name.c_str());
+        rec.state = impl::weight_state::unloaded;
+        return false;
+    }
+
+    size_t owners = 0;
+    for (const auto & other : pimpl->weight_records) {
+        if (other.tensor->weight_buffer == old_buf) {
+            owners++;
+        }
+    }
+    if (owners > 1) {
+        err_msg = format("tensor '%s' is in a shared weight buffer; use --no-mmap --parallel-load or --async-io-load for per-tensor unload", rec.name.c_str());
+        return false;
+    }
+
+    auto ph_it = pimpl->weight_placeholders.find(rec.buft);
+    if (ph_it == pimpl->weight_placeholders.end()) {
+        ggml_backend_buffer_t placeholder = ggml_backend_buft_alloc_buffer(rec.buft, 0);
+        if (!placeholder) {
+            err_msg = format("failed to allocate placeholder buffer for '%s'", rec.name.c_str());
+            return false;
+        }
+        ggml_backend_buffer_set_usage(placeholder, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ph_it = pimpl->weight_placeholders.emplace(rec.buft, ggml_backend_buffer_ptr(placeholder)).first;
+    }
+    ggml_backend_buffer_t placeholder = ph_it->second.get();
+
+    const size_t freed = ggml_backend_buffer_get_size(old_buf);
+
+    rec.tensor->buffer = placeholder;
+    rec.tensor->weight_buffer = nullptr;
+    rec.tensor->data = nullptr;
+    for (ggml_tensor * view : rec.views) {
+        view->buffer = placeholder;
+        view->weight_buffer = nullptr;
+        view->data = nullptr;
+    }
+
+    auto & bufs = pimpl->ctxs_bufs.at(rec.ctx_index).second;
+    auto old_it = std::find_if(bufs.begin(), bufs.end(), [old_buf](const ggml_backend_buffer_ptr & ptr) {
+        return ptr.get() == old_buf;
+    });
+    if (old_it != bufs.end()) {
+        bufs.erase(old_it);
+    } else {
+        err_msg = format("tensor '%s' buffer owner was not found", rec.name.c_str());
+        return false;
+    }
+
+    rec.state = impl::weight_state::unloaded;
+    rec.error.clear();
+    pimpl->weight_epoch_value.fetch_add(1, std::memory_order_relaxed);
+    pimpl->weight_cv.notify_all();
+
+    if (bytes_freed) {
+        *bytes_freed = freed;
+    }
+    return true;
+}
+
+bool llama_model::unload_all_tensors(std::string & err_msg, size_t * bytes_freed, size_t * tensors_unloaded) {
+    if (bytes_freed) {
+        *bytes_freed = 0;
+    }
+    if (tensors_unloaded) {
+        *tensors_unloaded = 0;
+    }
+
+    std::vector<std::string> names;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (const auto & rec : pimpl->weight_records) {
+            if (rec.state != impl::weight_state::ready) {
+                continue;
+            }
+            if (llama_tensor_name_matches_env_regex("LLAMA_WEIGHT_UNLOAD_KEEP_REGEX", rec.name)) {
+                LLAMA_LOG_INFO("%s: keeping tensor '%s' resident due to LLAMA_WEIGHT_UNLOAD_KEEP_REGEX\n", __func__, rec.name.c_str());
+                continue;
+            }
+            names.push_back(rec.name);
+        }
+    }
+
+    for (const auto & name : names) {
+        size_t freed = 0;
+        std::string cur_err;
+        if (!unload_tensor(name.c_str(), cur_err, &freed)) {
+            if (err_msg.empty()) {
+                err_msg = cur_err;
+            }
+            continue;
+        }
+        if (bytes_freed) {
+            *bytes_freed += freed;
+        }
+        if (tensors_unloaded) {
+            (*tensors_unloaded)++;
+        }
+    }
+
+    return err_msg.empty();
+}
+
+bool llama_model::unload_tensor_fraction(float fraction, std::string & err_msg,
+        size_t * bytes_freed, size_t * tensors_unloaded, size_t * bytes_considered) {
+    if (fraction <= 0.0f) {
+        err_msg = "fraction must be positive";
+        return false;
+    }
+    if (fraction > 1.0f) {
+        fraction = 1.0f;
+    }
+    if (bytes_freed) {
+        *bytes_freed = 0;
+    }
+    if (tensors_unloaded) {
+        *tensors_unloaded = 0;
+    }
+    if (bytes_considered) {
+        *bytes_considered = 0;
+    }
+
+    std::vector<std::pair<std::string, size_t>> candidates;
+    size_t total = 0;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (const auto & rec : pimpl->weight_records) {
+            if (rec.state != impl::weight_state::ready) {
+                continue;
+            }
+            if (llama_tensor_name_matches_env_regex("LLAMA_WEIGHT_UNLOAD_KEEP_REGEX", rec.name)) {
+                LLAMA_LOG_INFO("%s: keeping tensor '%s' resident due to LLAMA_WEIGHT_UNLOAD_KEEP_REGEX\n", __func__, rec.name.c_str());
+                continue;
+            }
+            total += rec.nbytes;
+            candidates.emplace_back(rec.name, rec.nbytes);
+        }
+    }
+
+    if (bytes_considered) {
+        *bytes_considered = total;
+    }
+
+    const size_t target = (size_t) std::ceil((double) total * fraction);
+    size_t selected = 0;
+    for (const auto & candidate : candidates) {
+        if (selected >= target) {
+            break;
+        }
+        size_t freed = 0;
+        std::string cur_err;
+        if (!unload_tensor(candidate.first.c_str(), cur_err, &freed)) {
+            if (err_msg.empty()) {
+                err_msg = cur_err;
+            }
+            continue;
+        }
+        selected += candidate.second;
+        if (bytes_freed) {
+            *bytes_freed += freed;
+        }
+        if (tensors_unloaded) {
+            (*tensors_unloaded)++;
+        }
+    }
+
+    return err_msg.empty();
+}
+
+bool llama_model::is_tensor_loaded(const char * name) const {
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+    auto it = pimpl->weight_by_name.find(name ? name : "");
+    if (it == pimpl->weight_by_name.end()) {
+        return false;
+    }
+    return pimpl->weight_records[it->second].state == impl::weight_state::ready;
+}
+
+std::vector<size_t> llama_model::weight_barrier_indices_for_locked(const std::vector<size_t> & seed_indices) const {
+    const int target = llama_env_i32("LLAMA_WEIGHT_BARRIER_TARGET", 8, 1, 1024);
+    const int stride = llama_env_i32("LLAMA_WEIGHT_BARRIER_STRIDE", target, 1, 1024);
+
+    bool include_global = false;
+    bool include_output = false;
+    std::vector<std::pair<int, int>> layer_ranges;
+
+    for (size_t index : seed_indices) {
+        if (index >= pimpl->weight_records.size()) {
+            continue;
+        }
+
+        const auto & rec = pimpl->weight_records[index];
+        if (rec.layer == -1) {
+            include_global = true;
+        } else if (rec.layer == INT_MAX) {
+            include_output = true;
+        } else {
+            const int begin = (rec.layer / stride) * stride;
+            const int end = begin + target - 1;
+            layer_ranges.emplace_back(begin, end);
+        }
+    }
+
+    std::vector<size_t> result;
+    for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+        const auto & rec = pimpl->weight_records[i];
+        if (rec.state == impl::weight_state::ready) {
+            continue;
+        }
+
+        bool selected = false;
+        if (include_global && rec.layer == -1) {
+            selected = true;
+        } else if (include_output && rec.layer == INT_MAX) {
+            selected = true;
+        } else if (rec.layer >= 0 && rec.layer != INT_MAX) {
+            for (const auto & range : layer_ranges) {
+                if (rec.layer >= range.first && rec.layer <= range.second) {
+                    selected = true;
+                    break;
+                }
+            }
+        }
+
+        if (selected) {
+            result.push_back(i);
+        }
+    }
+
+    return result;
+}
+
+bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, std::string & err_msg, const char * trace_name) {
+    struct restore_item {
+        size_t index = 0;
+        std::string name;
+        std::string file_path;
+        size_t file_offs = 0;
+        size_t nbytes = 0;
+        ggml_tensor * tensor = nullptr;
+        std::vector<ggml_tensor *> views;
+        int layer = -1;
+        bool host = false;
+        std::vector<uint8_t> staging;
+        std::string error;
+    };
+
+    std::vector<restore_item> items;
+    impl::weight_restore_metrics metrics;
+    const int64_t t_ready_start = ggml_time_us();
+
+    {
+        std::unique_lock<std::mutex> lock(pimpl->weight_mutex);
+        const int64_t t_alloc_start = ggml_time_us();
+
+        for (size_t index : indices) {
+            if (index >= pimpl->weight_records.size()) {
+                continue;
+            }
+
+            auto & rec = pimpl->weight_records[index];
+            while (rec.state == impl::weight_state::loading ||
+                   rec.state == impl::weight_state::staged ||
+                   rec.state == impl::weight_state::submitted) {
+                pimpl->weight_cv.wait(lock);
+            }
+            if (rec.state == impl::weight_state::ready) {
+                continue;
+            }
+
+            if (rec.file_idx >= pimpl->weight_file_paths.size() || pimpl->weight_file_paths[rec.file_idx].empty()) {
+                rec.state = impl::weight_state::failed;
+                rec.error = "source file path is unavailable";
+                err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
+                pimpl->weight_cv.notify_all();
+                return false;
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(rec.buft, ggml_backend_buft_get_alloc_size(rec.buft, rec.tensor));
+            if (!buf) {
+                rec.state = impl::weight_state::failed;
+                rec.error = "failed to allocate concrete weight buffer";
+                err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
+                pimpl->weight_cv.notify_all();
+                return false;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            rec.tensor->buffer = nullptr;
+            rec.tensor->weight_buffer = nullptr;
+            rec.tensor->data = nullptr;
+            ggml_backend_tensor_alloc(buf, rec.tensor, ggml_backend_buffer_get_base(buf));
+
+            for (ggml_tensor * view : rec.views) {
+                view->buffer = nullptr;
+                view->weight_buffer = nullptr;
+                view->data = nullptr;
+                ggml_backend_view_init(view);
+            }
+
+            pimpl->ctxs_bufs.at(rec.ctx_index).second.emplace_back(buf);
+            rec.state = impl::weight_state::loading;
+            rec.error.clear();
+
+            restore_item item;
+            item.index = index;
+            item.name = rec.name;
+            item.file_path = pimpl->weight_file_paths[rec.file_idx];
+            item.file_offs = rec.file_offs;
+            item.nbytes = rec.nbytes;
+            item.tensor = rec.tensor;
+            item.views = rec.views;
+            item.layer = rec.layer;
+            item.host = ggml_backend_buffer_is_host(buf);
+            if (!item.host) {
+                item.staging.resize(item.nbytes);
+            }
+            items.emplace_back(std::move(item));
+        }
+
+        metrics.alloc_us = ggml_time_us() - t_alloc_start;
+        metrics.tensor_count = items.size();
+        pimpl->weight_cv.notify_all();
+    }
+
+    if (items.empty()) {
+        return true;
+    }
+
+    int queue_count = 1;
+    if (params.async_io_load) {
+#if defined(__ANDROID__)
+        queue_count = 2;
+#else
+        queue_count = 2;
+#endif
+        queue_count = llama_env_i32("LLAMA_ASYNC_IO_QUEUES", queue_count, 1, 4);
+    }
+    metrics.queue_count = (size_t) queue_count;
+
+    if (params.async_io_load && pimpl->weight_micro_stats) {
+        LLAMA_LOG_INFO("llama_load_all_tensor_data_async_io: loading tensor data with %d async IO queues\n", queue_count);
+    }
+
+    auto group_label = [](const std::vector<size_t> & group, const std::vector<restore_item> & restore_items) {
+        bool has_global = false;
+        bool has_output = false;
+        int min_layer = INT_MAX;
+        int max_layer = -1;
+        for (size_t item_index : group) {
+            const int layer = restore_items[item_index].layer;
+            if (layer == -1) {
+                has_global = true;
+            } else if (layer == INT_MAX) {
+                has_output = true;
+            } else {
+                min_layer = std::min(min_layer, layer);
+                max_layer = std::max(max_layer, layer);
+            }
+        }
+
+        std::ostringstream ss;
+        if (has_global) {
+            ss << "global";
+        } else if (min_layer != INT_MAX) {
+            if (min_layer == max_layer) {
+                ss << "layer." << min_layer;
+            } else {
+                ss << "layer." << min_layer << ".." << max_layer;
+            }
+        } else if (has_output) {
+            ss << "output";
+        } else {
+            ss << "unknown";
+        }
+        if (has_output && min_layer != INT_MAX) {
+            ss << "+output";
+        }
+        return ss.str();
+    };
+
+    auto make_restore_groups = [&]() {
+        const int target = llama_env_i32("LLAMA_WEIGHT_BARRIER_TARGET", 8, 1, 1024);
+
+        std::vector<size_t> globals;
+        std::vector<size_t> outputs;
+        std::map<int, std::vector<size_t>> layers;
+        std::vector<size_t> others;
+
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].layer == -1) {
+                globals.push_back(i);
+            } else if (items[i].layer == INT_MAX) {
+                outputs.push_back(i);
+            } else if (items[i].layer >= 0) {
+                layers[items[i].layer].push_back(i);
+            } else {
+                others.push_back(i);
+            }
+        }
+
+        std::vector<std::vector<size_t>> groups;
+        if (!globals.empty()) {
+            groups.push_back(std::move(globals));
+        }
+
+        std::vector<size_t> layer_group;
+        int group_first = -1;
+        int group_last = -1;
+        for (auto & layer : layers) {
+            if (layer_group.empty()) {
+                group_first = layer.first;
+                group_last = layer.first;
+            }
+            const bool split = !layer_group.empty() && layer.first > group_first && (layer.first - group_first) >= target;
+            if (split) {
+                groups.push_back(std::move(layer_group));
+                layer_group.clear();
+                group_first = layer.first;
+            }
+            group_last = layer.first;
+            layer_group.insert(layer_group.end(), layer.second.begin(), layer.second.end());
+        }
+        GGML_UNUSED(group_last);
+        if (!layer_group.empty()) {
+            groups.push_back(std::move(layer_group));
+        }
+
+        if (!outputs.empty()) {
+            if (!groups.empty()) {
+                groups.back().insert(groups.back().end(), outputs.begin(), outputs.end());
+            } else {
+                groups.push_back(std::move(outputs));
+            }
+        }
+        if (!others.empty()) {
+            groups.push_back(std::move(others));
+        }
+        return groups;
+    };
+
+    const auto restore_groups = make_restore_groups();
+    metrics.reload_group_count = restore_groups.size();
+
+    if ((pimpl->weight_micro_stats || llama_env_enabled("LLAMA_WEIGHT_LOAD_TRACE")) && !restore_groups.empty()) {
+        LLAMA_LOG_INFO("%s: restoring %zu weight tensors in %zu adaptive reload groups (target=%d)\n",
+                __func__, items.size(), restore_groups.size(),
+                llama_env_i32("LLAMA_WEIGHT_BARRIER_TARGET", 8, 1, 1024));
+    }
+
+    for (size_t group_index = 0; group_index < restore_groups.size(); ++group_index) {
+        const auto & group = restore_groups[group_index];
+        impl::weight_restore_metrics group_metrics;
+        group_metrics.alloc_us = group_index == 0 ? metrics.alloc_us : 0;
+        group_metrics.queue_count = metrics.queue_count;
+        group_metrics.tensor_count = group.size();
+        group_metrics.reload_group_count = restore_groups.size();
+        const int64_t t_group_start = ggml_time_us();
+
+        llama_weight_test_wait_file_gate();
+
+        std::atomic<size_t> next_item{0};
+        std::atomic<int64_t> read_worker_us{0};
+        const int64_t t_read_start = ggml_time_us();
+        std::vector<std::thread> workers;
+        workers.reserve((size_t) queue_count);
+
+        for (int q = 0; q < queue_count; ++q) {
+            workers.emplace_back([&, q] {
+                GGML_UNUSED(q);
+                while (true) {
+                    const size_t group_pos = next_item.fetch_add(1);
+                    if (group_pos >= group.size()) {
+                        break;
+                    }
+
+                    auto & item = items[group[group_pos]];
+                    const int64_t t0 = ggml_time_us();
+                    try {
+                        llama_file file(item.file_path.c_str(), "rb", pimpl->weight_use_direct_io);
+                        if (pimpl->weight_use_direct_io) {
+                            file.seek(item.file_offs, SEEK_SET);
+                            file.read_raw(item.host ? item.tensor->data : item.staging.data(), item.nbytes);
+                        } else {
+                            file.read_raw_at(item.file_offs, item.host ? item.tensor->data : item.staging.data(), item.nbytes);
+                        }
+                    } catch (const std::exception & ex) {
+                        item.error = ex.what();
+                    }
+                    read_worker_us.fetch_add(ggml_time_us() - t0, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        for (auto & worker : workers) {
+            worker.join();
+        }
+
+        group_metrics.read_wall_us = ggml_time_us() - t_read_start;
+        group_metrics.read_worker_us = read_worker_us.load(std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            for (size_t item_index : group) {
+                auto & rec = pimpl->weight_records[items[item_index].index];
+                if (rec.state == impl::weight_state::loading) {
+                    rec.state = impl::weight_state::staged;
+                }
+            }
+            pimpl->weight_cv.notify_all();
+        }
+
+        const int64_t t_upload_start = ggml_time_us();
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            for (size_t item_index : group) {
+                auto & rec = pimpl->weight_records[items[item_index].index];
+                if (rec.state == impl::weight_state::staged) {
+                    rec.state = impl::weight_state::submitted;
+                }
+            }
+            pimpl->weight_cv.notify_all();
+        }
+
+        for (size_t item_index : group) {
+            auto & item = items[item_index];
+            group_metrics.read_bytes += item.nbytes;
+            if (!item.error.empty()) {
+                continue;
+            }
+
+            if (!item.host) {
+                ggml_backend_tensor_set(item.tensor, item.staging.data(), 0, item.nbytes);
+                group_metrics.upload_bytes += item.nbytes;
+                group_metrics.upload_batches++;
+            } else {
+                group_metrics.upload_bytes += item.nbytes;
+            }
+        }
+        group_metrics.upload_set_us = ggml_time_us() - t_upload_start;
+        group_metrics.ready_us = ggml_time_us() - t_group_start;
+
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            for (size_t item_index : group) {
+                const auto & item = items[item_index];
+                auto & rec = pimpl->weight_records[item.index];
+                if (!item.error.empty()) {
+                    rec.state = impl::weight_state::failed;
+                    rec.error = item.error;
+                    if (err_msg.empty()) {
+                        err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
+                    }
+                    continue;
+                }
+
+                rec.state = impl::weight_state::ready;
+                rec.error.clear();
+            }
+
+            metrics.ready_us = ggml_time_us() - t_ready_start;
+            metrics.read_wall_us += group_metrics.read_wall_us;
+            metrics.read_worker_us += group_metrics.read_worker_us;
+            metrics.upload_set_us += group_metrics.upload_set_us;
+            metrics.upload_sync_us += group_metrics.upload_sync_us;
+            metrics.read_bytes += group_metrics.read_bytes;
+            metrics.upload_bytes += group_metrics.upload_bytes;
+            metrics.upload_batches += group_metrics.upload_batches;
+            pimpl->last_weight_metrics = metrics;
+            pimpl->weight_epoch_value.fetch_add(1, std::memory_order_relaxed);
+            pimpl->weight_cv.notify_all();
+        }
+
+        if (pimpl->weight_micro_stats || llama_env_enabled("LLAMA_WEIGHT_LOAD_TRACE")) {
+            const std::string label = group_label(group, items);
+            LLAMA_LOG_INFO(
+                    "weight_load_trace: stage=%s group=%s group_index=%zu/%zu ready=%.2fms alloc=%.2fms read_wall=%.2fms read_worker=%.2fms upload_set=%.2fms upload_sync=%.2fms read_bytes=%zu upload_bytes=%zu upload_batches=%zu queues=%zu tensors=%zu reload_groups=%zu direct_set=%d\n",
+                    trace_name ? trace_name : "restore",
+                    label.c_str(), group_index + 1, restore_groups.size(),
+                    group_metrics.ready_us / 1000.0, group_metrics.alloc_us / 1000.0, group_metrics.read_wall_us / 1000.0,
+                    group_metrics.read_worker_us / 1000.0, group_metrics.upload_set_us / 1000.0, group_metrics.upload_sync_us / 1000.0,
+                    group_metrics.read_bytes, group_metrics.upload_bytes, group_metrics.upload_batches,
+                    group_metrics.queue_count, group_metrics.tensor_count, group_metrics.reload_group_count,
+                    llama_env_enabled("LLAMA_VK_HOST_VISIBLE_DIRECT_SET") ? 1 : 0);
+        }
+    }
+
+    if (!err_msg.empty()) {
+        return false;
+    }
+    return true;
+}
+
+bool llama_model::ensure_tensors_ready(std::string & err_msg) {
+    wait_async_tensors_load();
+
+    std::vector<size_t> indices;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            if (pimpl->weight_records[i].state != impl::weight_state::ready) {
+                indices.push_back(i);
+            }
+        }
+    }
+
+    return restore_weight_indices(indices, err_msg, "ensure_all");
+}
+
+bool llama_model::ensure_global_tensors_ready(std::string & err_msg) {
+    std::vector<size_t> indices;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            const auto & rec = pimpl->weight_records[i];
+            if (rec.layer == -1 && rec.state != impl::weight_state::ready) {
+                indices.push_back(i);
+            }
+        }
+    }
+
+    if (!indices.empty()) {
+        LLAMA_LOG_INFO("%s: restoring %zu global weight tensors before graph reserve\n", __func__, indices.size());
+    }
+    return restore_weight_indices(indices, err_msg, "ensure_global");
+}
+
+bool llama_model::ensure_layer_tensors_ready(int il, std::string & err_msg) {
+    std::vector<size_t> indices;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            const auto & rec = pimpl->weight_records[i];
+            if (rec.layer == il && rec.state != impl::weight_state::ready) {
+                indices.push_back(i);
+            }
+        }
+    }
+
+    return restore_weight_indices(indices, err_msg, "layer_wait");
+}
+
+bool llama_model::ensure_output_tensors_ready(std::string & err_msg) {
+    std::vector<size_t> indices;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            const auto & rec = pimpl->weight_records[i];
+            if (rec.layer == INT_MAX && rec.state != impl::weight_state::ready) {
+                indices.push_back(i);
+            }
+        }
+    }
+
+    return restore_weight_indices(indices, err_msg, "output_wait");
+}
+
+void llama_model::prefetch_unloaded_tensors() {
+    size_t n_unloaded = 0;
+    int first_layer = INT_MAX;
+    std::vector<size_t> indices;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            const auto & rec = pimpl->weight_records[i];
+            if (rec.state != impl::weight_state::unloaded) {
+                continue;
+            }
+            indices.push_back(i);
+            n_unloaded++;
+            if (rec.layer >= 0 && rec.layer != INT_MAX) {
+                first_layer = std::min(first_layer, rec.layer);
+            }
+        }
+    }
+
+    if (n_unloaded == 0) {
+        return;
+    }
+
+    if (first_layer == INT_MAX) {
+        LLAMA_LOG_INFO("%s: prefetching %zu unloaded weight tensors\n", __func__, n_unloaded);
+    } else {
+        LLAMA_LOG_INFO("%s: prefetching %zu unloaded weight groups starting at layer %d\n", __func__, n_unloaded, first_layer);
+    }
+
+    if (params.parallel_load) {
+        start_async_tensors_load();
+        std::unique_lock<std::mutex> lock(pimpl->weight_mutex);
+        pimpl->weight_cv.wait(lock, [&] {
+            for (size_t index : indices) {
+                if (index < pimpl->weight_records.size() &&
+                    pimpl->weight_records[index].state == impl::weight_state::unloaded) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    } else {
+        std::string err;
+        if (!ensure_tensors_ready(err)) {
+            LLAMA_LOG_ERROR("%s: failed to restore weights: %s\n", __func__, err.c_str());
+        }
+    }
+}
+
+void llama_model::start_async_tensors_load() {
+    if (pimpl->lazy_load_thread.joinable()) {
+        pimpl->lazy_load_thread.join();
+    }
+    if (!params.parallel_load) {
+        return;
+    }
+
+    std::vector<size_t> indices;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            if (pimpl->weight_records[i].state == impl::weight_state::unloaded ||
+                pimpl->weight_records[i].state == impl::weight_state::failed) {
+                indices.push_back(i);
+            }
+        }
+    }
+    if (indices.empty()) {
+        return;
+    }
+
+    pimpl->lazy_load_thread = std::thread([this] {
+        std::string err;
+        std::vector<size_t> indices;
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+                if (pimpl->weight_records[i].state == impl::weight_state::unloaded ||
+                    pimpl->weight_records[i].state == impl::weight_state::failed) {
+                    indices.push_back(i);
+                }
+            }
+        }
+        if (!this->restore_weight_indices(indices, err, "prefetch_ordered")) {
+            LLAMA_LOG_ERROR("%s: async tensor load failed: %s\n", __func__, err.c_str());
+        }
+    });
+}
+
+void llama_model::wait_async_tensors_load() {
+    if (pimpl->lazy_load_thread.joinable()) {
+        pimpl->lazy_load_thread.join();
+    }
+}
+
+bool llama_model::ensure_node_tensors_ready(struct ggml_tensor * node, std::string & err_msg) {
+    std::vector<size_t> seed_indices;
+    auto collect = [&](ggml_tensor * t) {
+        if (!t) {
+            return;
+        }
+        if (t->view_src) {
+            t = t->view_src;
+        }
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        auto it = pimpl->weight_by_tensor.find(t);
+        if (it == pimpl->weight_by_tensor.end()) {
+            return;
+        }
+        if (pimpl->weight_records[it->second].state != impl::weight_state::ready) {
+            seed_indices.push_back(it->second);
+        }
+    };
+
+    collect(node);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        collect(node->src[i]);
+    }
+
+    if (seed_indices.empty()) {
+        return true;
+    }
+    std::sort(seed_indices.begin(), seed_indices.end());
+    seed_indices.erase(std::unique(seed_indices.begin(), seed_indices.end()), seed_indices.end());
+
+    std::vector<size_t> indices;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        indices = weight_barrier_indices_for_locked(seed_indices);
+    }
+
+    if (indices.empty()) {
+        return true;
+    }
+
+    if (llama_env_enabled("LLAMA_WEIGHT_WAIT_DEBUG")) {
+        int min_layer = INT_MAX;
+        int max_layer = -1;
+        bool has_global = false;
+        bool has_output = false;
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            for (size_t index : indices) {
+                if (index >= pimpl->weight_records.size()) {
+                    continue;
+                }
+                const int layer = pimpl->weight_records[index].layer;
+                if (layer == -1) {
+                    has_global = true;
+                } else if (layer == INT_MAX) {
+                    has_output = true;
+                } else {
+                    min_layer = std::min(min_layer, layer);
+                    max_layer = std::max(max_layer, layer);
+                }
+            }
+        }
+        std::ostringstream label;
+        if (has_global) {
+            label << "global";
+        } else if (min_layer != INT_MAX) {
+            label << "layer." << min_layer;
+            if (max_layer != min_layer) {
+                label << ".." << max_layer;
+            }
+            if (has_output) {
+                label << "+output";
+            }
+        } else if (has_output) {
+            label << "output";
+        } else {
+            label << "unknown";
+        }
+        LLAMA_LOG_INFO("%s: barrier node='%s' group=%s tensors=%zu target=%d stride=%d\n",
+                __func__, node ? ggml_get_name(node) : "(null)", label.str().c_str(), indices.size(),
+                llama_env_i32("LLAMA_WEIGHT_BARRIER_TARGET", 8, 1, 1024),
+                llama_env_i32("LLAMA_WEIGHT_BARRIER_STRIDE", llama_env_i32("LLAMA_WEIGHT_BARRIER_TARGET", 8, 1, 1024), 1, 1024));
+    }
+
+    return restore_weight_indices(indices, err_msg, "barrier_wait");
+}
+
+bool llama_model::has_unready_tensors() const {
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+    for (const auto & rec : pimpl->weight_records) {
+        if (rec.state != impl::weight_state::ready) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<int> llama_model::unready_layer_indices() const {
+    std::vector<int> result;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        for (const auto & rec : pimpl->weight_records) {
+            if (rec.layer >= 0 && rec.layer != INT_MAX && rec.state != impl::weight_state::ready) {
+                result.push_back(rec.layer);
+            }
+        }
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+bool llama_model::output_tensors_ready() const {
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+    for (const auto & rec : pimpl->weight_records) {
+        if (rec.layer == INT_MAX && rec.state != impl::weight_state::ready) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint64_t llama_model::weight_epoch() const {
+    return pimpl->weight_epoch_value.load(std::memory_order_relaxed);
+}
+
+bool llama_model::last_weight_load_metrics(struct llama_model_weight_load_metrics * metrics) const {
+    if (!metrics) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+    const auto & src = pimpl->last_weight_metrics;
+    metrics->ready_us = src.ready_us;
+    metrics->alloc_us = src.alloc_us;
+    metrics->read_wall_us = src.read_wall_us;
+    metrics->read_worker_us = src.read_worker_us;
+    metrics->upload_set_us = src.upload_set_us;
+    metrics->upload_sync_us = src.upload_sync_us;
+    metrics->read_bytes = src.read_bytes;
+    metrics->upload_bytes = src.upload_bytes;
+    metrics->upload_batches = src.upload_batches;
+    metrics->queue_count = src.queue_count;
+    metrics->tensor_count = src.tensor_count;
+    metrics->reload_group_count = src.reload_group_count;
+    return src.tensor_count > 0 || src.reload_group_count > 0;
+}
+
+int32_t llama_model::weight_count() const {
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+    return (int32_t) pimpl->weight_records.size();
+}
+
+int32_t llama_model::weight_name_by_index(int32_t i, char * buf, size_t buf_size) const {
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+    if (i < 0 || (size_t) i >= pimpl->weight_records.size()) {
+        if (buf && buf_size > 0) {
+            buf[0] = '\0';
+        }
+        return -1;
+    }
+
+    const std::string & name = pimpl->weight_records[(size_t) i].name;
+    if (buf && buf_size > 0) {
+        snprintf(buf, buf_size, "%s", name.c_str());
+    }
+    return (int32_t) name.size();
+}
+
+bool llama_model::weight_info_by_index(int32_t i, size_t * nbytes, int32_t * layer, bool * loaded) const {
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+    if (i < 0 || (size_t) i >= pimpl->weight_records.size()) {
+        return false;
+    }
+
+    const auto & rec = pimpl->weight_records[(size_t) i];
+    if (nbytes) {
+        *nbytes = rec.nbytes;
+    }
+    if (layer) {
+        *layer = rec.layer;
+    }
+    if (loaded) {
+        *loaded = rec.state == impl::weight_state::ready;
+    }
     return true;
 }
 
@@ -9291,6 +10496,9 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.parallel_load               =*/ false,
+        /*.async_io_load               =*/ false,
+        /*.load_micro_stats            =*/ false,
     };
 
     return result;
@@ -9298,6 +10506,78 @@ llama_model_params llama_model_default_params() {
 
 const llama_vocab * llama_model_get_vocab(const llama_model * model) {
     return &model->vocab;
+}
+
+bool llama_model_unload_all_tensors(struct llama_model * model, size_t * bytes_freed, size_t * tensors_unloaded) {
+    std::string err;
+    const bool ok = model->unload_all_tensors(err, bytes_freed, tensors_unloaded);
+    if (!ok && !err.empty()) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+    }
+    return ok;
+}
+
+bool llama_model_unload_tensor_fraction(struct llama_model * model, float fraction, size_t * bytes_freed, size_t * tensors_unloaded, size_t * bytes_considered) {
+    std::string err;
+    const bool ok = model->unload_tensor_fraction(fraction, err, bytes_freed, tensors_unloaded, bytes_considered);
+    if (!ok && !err.empty()) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+    }
+    return ok;
+}
+
+bool llama_model_unload_tensor(struct llama_model * model, const char * name, size_t * bytes_freed) {
+    std::string err;
+    const bool ok = model->unload_tensor(name, err, bytes_freed);
+    if (!ok && !err.empty()) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+    }
+    return ok;
+}
+
+bool llama_model_is_tensor_loaded(const struct llama_model * model, const char * name) {
+    return model->is_tensor_loaded(name);
+}
+
+bool llama_model_ensure_tensors_ready(struct llama_model * model) {
+    std::string err;
+    const bool ok = model->ensure_tensors_ready(err);
+    if (!ok && !err.empty()) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+    }
+    return ok;
+}
+
+void llama_model_prefetch_unloaded_tensors(struct llama_model * model) {
+    model->prefetch_unloaded_tensors();
+}
+
+void llama_model_start_async_tensors_load(struct llama_model * model) {
+    model->start_async_tensors_load();
+}
+
+void llama_model_wait_async_tensors_load(struct llama_model * model) {
+    model->wait_async_tensors_load();
+}
+
+uint64_t llama_model_weight_epoch(const struct llama_model * model) {
+    return model->weight_epoch();
+}
+
+bool llama_model_weight_last_load_metrics(const struct llama_model * model, struct llama_model_weight_load_metrics * metrics) {
+    return model->last_weight_load_metrics(metrics);
+}
+
+int32_t llama_model_weight_count(const struct llama_model * model) {
+    return model->weight_count();
+}
+
+int32_t llama_model_weight_name_by_index(const struct llama_model * model, int32_t i, char * buf, size_t buf_size) {
+    return model->weight_name_by_index(i, buf, buf_size);
+}
+
+bool llama_model_weight_info_by_index(const struct llama_model * model, int32_t i, size_t * nbytes, int32_t * layer, bool * loaded) {
+    return model->weight_info_by_index(i, nbytes, layer, loaded);
 }
 
 void llama_free_model(llama_model * model) {

@@ -128,6 +128,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    bool sync_model_weight_epoch();
 
     //
     // state save/load
@@ -312,6 +313,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    uint64_t weight_epoch_seen = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

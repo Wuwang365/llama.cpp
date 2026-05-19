@@ -10,9 +10,11 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <climits>
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <vector>
 #include <signal.h>
 
 #if defined(_WIN32)
@@ -36,6 +38,50 @@ const char * LLAMA_ASCII_LOGO = R"(
 static std::atomic<bool> g_is_interrupted = false;
 static bool should_stop() {
     return g_is_interrupted.load();
+}
+
+static void cli_list_weights(const llama_model * model) {
+    const int32_t n_weights = llama_model_weight_count(model);
+    size_t loaded_bytes = 0;
+    size_t unloaded_bytes = 0;
+    int32_t loaded_count = 0;
+
+    console::log("weights: %d\n", n_weights);
+    for (int32_t i = 0; i < n_weights; ++i) {
+        const int32_t name_len = llama_model_weight_name_by_index(model, i, nullptr, 0);
+        if (name_len < 0) {
+            continue;
+        }
+
+        std::vector<char> name((size_t) name_len + 1);
+        llama_model_weight_name_by_index(model, i, name.data(), name.size());
+
+        size_t nbytes = 0;
+        int32_t layer = -1;
+        bool loaded = false;
+        if (!llama_model_weight_info_by_index(model, i, &nbytes, &layer, &loaded)) {
+            continue;
+        }
+
+        loaded_count += loaded ? 1 : 0;
+        if (loaded) {
+            loaded_bytes += nbytes;
+        } else {
+            unloaded_bytes += nbytes;
+        }
+
+        const char * group = layer == -1 ? "global" : (layer == INT_MAX ? "output" : "layer");
+        if (layer >= 0 && layer != INT_MAX) {
+            console::log("  %-8s layer.%d %-8s %8.2f MiB  %s\n",
+                    loaded ? "loaded" : "unloaded", layer, group, nbytes / 1024.0 / 1024.0, name.data());
+        } else {
+            console::log("  %-8s %-7s %-8s %8.2f MiB  %s\n",
+                    loaded ? "loaded" : "unloaded", "", group, nbytes / 1024.0 / 1024.0, name.data());
+        }
+    }
+
+    console::log("summary: loaded %d/%d tensors, resident %.2f MiB, unloaded %.2f MiB\n",
+            loaded_count, n_weights, loaded_bytes / 1024.0 / 1024.0, unloaded_bytes / 1024.0 / 1024.0);
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -433,6 +479,8 @@ int main(int argc, char ** argv) {
     console::log("  /exit or Ctrl+C     stop or exit\n");
     console::log("  /regen              regenerate the last response\n");
     console::log("  /clear              clear the chat history\n");
+    console::log("  /list_weight        list model weight residency state\n");
+    console::log("  /unload <tensor>    unload a model weight tensor\n");
     console::log("  /read <file>        add a text file\n");
     console::log("  /glob <pattern>     add text files using globbing pattern\n");
     if (inf.has_inp_image) {
@@ -534,6 +582,25 @@ int main(int argc, char ** argv) {
 
             ctx_cli.input_files.clear();
             console::log("Chat history cleared.\n");
+            continue;
+        } else if (buffer == "/list_weight") {
+            const llama_model * model = llama_get_model(ctx_cli.ctx_server.get_llama_context());
+            cli_list_weights(model);
+            continue;
+        } else if (string_starts_with(buffer, "/unload ")) {
+            std::string name = string_strip(buffer.substr(8));
+            if (name.empty()) {
+                console::error("usage: /unload <tensor_name>\n");
+                continue;
+            }
+
+            llama_model * model = const_cast<llama_model *>(llama_get_model(ctx_cli.ctx_server.get_llama_context()));
+            size_t bytes_freed = 0;
+            if (llama_model_unload_tensor(model, name.c_str(), &bytes_freed)) {
+                console::log("Unloaded '%s', freed %.2f MiB.\n", name.c_str(), bytes_freed / 1024.0 / 1024.0);
+            } else {
+                console::error("Failed to unload '%s'.\n", name.c_str());
+            }
             continue;
         } else if (
                 (string_starts_with(buffer, "/image ") && inf.has_inp_image) ||

@@ -535,6 +535,11 @@ struct common_params {
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
     bool use_mlock         = false; // use mlock to keep model in memory
+    bool parallel_load     = false; // enable background-capable model weight loading/restoring
+    bool async_io_load     = false; // use explicit async IO queues for non-mmap weight loading
+    bool load_micro_stats  = false; // print fine-grained model weight loading stats
+    bool unload_all_after_load = false; // unload model weights after initial load
+    float unload_after_load_fraction = 0.0f; // unload this fraction of model weight bytes after load
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

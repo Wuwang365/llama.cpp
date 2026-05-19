@@ -1237,6 +1237,24 @@ common_init_result::common_init_result(common_params & params) :
     }
 
     pimpl->context.reset(lctx);
+
+    if (params.unload_all_after_load || params.unload_after_load_fraction > 0.0f) {
+        llama_model_ensure_tensors_ready(model);
+        llama_synchronize(lctx);
+
+        size_t bytes_freed = 0;
+        size_t tensors_unloaded = 0;
+        if (params.unload_all_after_load) {
+            LOG_INF("%s: loading then unloading all model weights before serving requests\n", __func__);
+            llama_model_unload_all_tensors(model, &bytes_freed, &tensors_unloaded);
+        } else {
+            size_t bytes_considered = 0;
+            LOG_INF("%s: loading then unloading %.3f of model weight bytes before serving requests\n", __func__, params.unload_after_load_fraction);
+            llama_model_unload_tensor_fraction(model, params.unload_after_load_fraction, &bytes_freed, &tensors_unloaded, &bytes_considered);
+            LOG_INF("%s: considered %.2f MiB of unloadable model weights\n", __func__, bytes_considered / 1024.0 / 1024.0);
+        }
+        LOG_INF("%s: unloaded %zu model weight tensors, freed %.2f MiB\n", __func__, tensors_unloaded, bytes_freed / 1024.0 / 1024.0);
+    }
 }
 
 llama_model * common_init_result::model() {
@@ -1422,6 +1440,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;
     mparams.use_mlock       = params.use_mlock;
+    mparams.parallel_load   = params.parallel_load;
+    mparams.async_io_load   = params.async_io_load;
+    mparams.load_micro_stats = params.load_micro_stats;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

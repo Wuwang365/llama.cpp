@@ -552,6 +552,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -564,7 +565,9 @@ llama_model_loader::llama_model_loader(
 
                 // reopen file using std::fopen for mmap
                 files.pop_back();
+                file_paths.pop_back();
                 files.emplace_back(new llama_file(fname.c_str(), "rb", false));
+                file_paths.emplace_back(fname);
             }
         }
 
@@ -634,6 +637,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -678,6 +682,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_paths.emplace_back();
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.

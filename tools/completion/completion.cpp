@@ -6,6 +6,7 @@
 #include "llama.h"
 #include "chat.h"
 
+#include <climits>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +42,50 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+static void completion_list_weights(const llama_model * model) {
+    const int32_t n_weights = llama_model_weight_count(model);
+    size_t loaded_bytes = 0;
+    size_t unloaded_bytes = 0;
+    int32_t loaded_count = 0;
+
+    LOG("weights: %d\n", n_weights);
+    for (int32_t i = 0; i < n_weights; ++i) {
+        const int32_t name_len = llama_model_weight_name_by_index(model, i, nullptr, 0);
+        if (name_len < 0) {
+            continue;
+        }
+
+        std::vector<char> name((size_t) name_len + 1);
+        llama_model_weight_name_by_index(model, i, name.data(), name.size());
+
+        size_t nbytes = 0;
+        int32_t layer = -1;
+        bool loaded = false;
+        if (!llama_model_weight_info_by_index(model, i, &nbytes, &layer, &loaded)) {
+            continue;
+        }
+
+        loaded_count += loaded ? 1 : 0;
+        if (loaded) {
+            loaded_bytes += nbytes;
+        } else {
+            unloaded_bytes += nbytes;
+        }
+
+        const char * group = layer == -1 ? "global" : (layer == INT_MAX ? "output" : "layer");
+        if (layer >= 0 && layer != INT_MAX) {
+            LOG("  %-8s layer.%d %-8s %8.2f MiB  %s\n",
+                    loaded ? "loaded" : "unloaded", layer, group, nbytes / 1024.0 / 1024.0, name.data());
+        } else {
+            LOG("  %-8s %-7s %-8s %8.2f MiB  %s\n",
+                    loaded ? "loaded" : "unloaded", "", group, nbytes / 1024.0 / 1024.0, name.data());
+        }
+    }
+
+    LOG("summary: loaded %d/%d tensors, resident %.2f MiB, unloaded %.2f MiB\n",
+            loaded_count, n_weights, loaded_bytes / 1024.0 / 1024.0, unloaded_bytes / 1024.0 / 1024.0);
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -535,6 +580,7 @@ int main(int argc, char ** argv) {
         LOG_INF(       " - Press Ctrl+C to interject at any time.\n");
 #endif
         LOG_INF(       "%s", control_message);
+        LOG_INF(       " - Weight commands: /list_weight, /unload <tensor_name>\n");
         if (params.conversation_mode && params.enable_chat_template && params.system_prompt.empty()) {
             LOG_INF(   " - Not using system message. To change it, set a different value via -sys PROMPT\n");
         }
@@ -897,6 +943,27 @@ int main(int argc, char ** argv) {
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
                 } else { // Add tokens to embd only if the input buffer is non-empty
+                    if (buffer == "/list_weight") {
+                        completion_list_weights(model);
+                        is_interacting = true;
+                        continue;
+                    }
+                    if (string_starts_with(buffer, "/unload ")) {
+                        std::string name = string_strip(buffer.substr(8));
+                        if (name.empty()) {
+                            LOG("usage: /unload <tensor_name>\n");
+                        } else {
+                            size_t bytes_freed = 0;
+                            if (llama_model_unload_tensor(model, name.c_str(), &bytes_freed)) {
+                                LOG("Unloaded '%s', freed %.2f MiB.\n", name.c_str(), bytes_freed / 1024.0 / 1024.0);
+                            } else {
+                                LOG("Failed to unload '%s'.\n", name.c_str());
+                            }
+                        }
+                        is_interacting = true;
+                        continue;
+                    }
+
                     // append input suffix if any
                     if (!params.input_suffix.empty() && !params.conversation_mode) {
                         LOG_DBG("appending input suffix: '%s'\n", params.input_suffix.c_str());
