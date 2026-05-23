@@ -160,6 +160,8 @@ static bool unload_selected(llama_model * model, const bench_params & bparams, s
             names.push_back(weight_name_at(model, i));
         }
     }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
 
     for (const auto & name : names) {
         size_t freed = 0;

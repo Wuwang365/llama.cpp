@@ -590,12 +590,14 @@ struct llama_model {
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
 
     bool unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed = nullptr);
+    bool unload_tensor_by_index_locked(size_t index, std::string & err_msg, size_t * bytes_freed = nullptr);
     bool unload_tensor_fraction(float fraction, std::string & err_msg,
             size_t * bytes_freed = nullptr, size_t * tensors_unloaded = nullptr, size_t * bytes_considered = nullptr);
     bool unload_all_tensors(std::string & err_msg, size_t * bytes_freed = nullptr, size_t * tensors_unloaded = nullptr);
     bool is_tensor_loaded(const char * name) const;
     bool ensure_tensors_ready(std::string & err_msg);
     bool ensure_global_tensors_ready(std::string & err_msg);
+    bool ensure_token_embedding_rows_ready(const llama_token * tokens, size_t n_tokens, std::string & err_msg);
     bool ensure_layer_tensors_ready(int il, std::string & err_msg);
     bool ensure_output_tensors_ready(std::string & err_msg);
     bool ensure_node_tensors_ready(struct ggml_tensor * node, std::string & err_msg);

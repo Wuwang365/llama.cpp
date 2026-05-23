@@ -42,6 +42,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
@@ -665,6 +666,7 @@ struct llama_model::impl {
         loading,
         staged,
         submitted,
+        partial,
         ready,
         failed,
     };
@@ -695,6 +697,7 @@ struct llama_model::impl {
         size_t ctx_index = 0;
         int layer = -1; // -1 global, >=0 layer, INT_MAX output
         weight_state state = weight_state::ready;
+        std::unordered_set<llama_token> partial_rows;
         std::string error;
     };
 
@@ -702,7 +705,7 @@ struct llama_model::impl {
     std::condition_variable weight_cv;
     std::atomic<uint64_t> weight_epoch_value{0};
     std::vector<weight_record> weight_records;
-    std::unordered_map<std::string, size_t> weight_by_name;
+    std::unordered_map<std::string, std::vector<size_t>> weight_by_name;
     std::unordered_map<ggml_tensor *, size_t> weight_by_tensor;
     std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr, llama_model_loader::ggml_backend_buft_comparator> weight_placeholders;
     std::vector<std::string> weight_file_paths;
@@ -782,6 +785,19 @@ static bool llama_env_enabled(const char * name) {
         return false;
     }
     return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+}
+
+static bool llama_weight_partial_embedding_enabled() {
+    return llama_env_enabled("LLAMA_WEIGHT_PARTIAL_EMBEDDING");
+}
+
+static bool llama_weight_is_token_embedding_name(const std::string & name) {
+    return name == "token_embd.weight";
+}
+
+static size_t llama_weight_stream_chunk_size() {
+    const int mb = llama_env_i32("LLAMA_ASYNC_IO_UPLOAD_BATCH_MB", 16, 1, 256);
+    return (size_t) mb * 1024 * 1024;
 }
 
 static void llama_weight_test_wait_file_gate() {
@@ -8443,7 +8459,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 rec.state = impl::weight_state::ready;
 
                 const size_t index = pimpl->weight_records.size();
-                pimpl->weight_by_name.emplace(rec.name, index);
+                pimpl->weight_by_name[rec.name].push_back(index);
                 pimpl->weight_by_tensor.emplace(t, index);
                 pimpl->weight_records.emplace_back(std::move(rec));
             }
@@ -8469,20 +8485,17 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-bool llama_model::unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed) {
+bool llama_model::unload_tensor_by_index_locked(size_t index, std::string & err_msg, size_t * bytes_freed) {
     if (bytes_freed) {
         *bytes_freed = 0;
     }
 
-    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
-
-    auto it = pimpl->weight_by_name.find(name ? name : "");
-    if (it == pimpl->weight_by_name.end()) {
-        err_msg = format("unknown tensor '%s'", name ? name : "");
+    if (index >= pimpl->weight_records.size()) {
+        err_msg = format("unknown tensor index %zu", index);
         return false;
     }
 
-    auto & rec = pimpl->weight_records[it->second];
+    auto & rec = pimpl->weight_records[index];
     if (rec.state == impl::weight_state::unloaded) {
         err_msg = format("tensor '%s' is already unloaded", rec.name.c_str());
         return false;
@@ -8555,6 +8568,7 @@ bool llama_model::unload_tensor(const char * name, std::string & err_msg, size_t
     }
 
     rec.state = impl::weight_state::unloaded;
+    rec.partial_rows.clear();
     rec.error.clear();
     pimpl->weight_epoch_value.fetch_add(1, std::memory_order_relaxed);
     pimpl->weight_cv.notify_all();
@@ -8562,6 +8576,44 @@ bool llama_model::unload_tensor(const char * name, std::string & err_msg, size_t
     if (bytes_freed) {
         *bytes_freed = freed;
     }
+    return true;
+}
+
+bool llama_model::unload_tensor(const char * name, std::string & err_msg, size_t * bytes_freed) {
+    if (bytes_freed) {
+        *bytes_freed = 0;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+
+    auto it = pimpl->weight_by_name.find(name ? name : "");
+    if (it == pimpl->weight_by_name.end()) {
+        err_msg = format("unknown tensor '%s'", name ? name : "");
+        return false;
+    }
+
+    bool unloaded_any = false;
+    std::string first_err;
+    for (size_t index : it->second) {
+        size_t freed = 0;
+        std::string cur_err;
+        if (!unload_tensor_by_index_locked(index, cur_err, &freed)) {
+            if (first_err.empty()) {
+                first_err = cur_err;
+            }
+            continue;
+        }
+        unloaded_any = true;
+        if (bytes_freed) {
+            *bytes_freed += freed;
+        }
+    }
+
+    if (!unloaded_any) {
+        err_msg = first_err.empty() ? format("tensor '%s' is already unloaded", name ? name : "") : first_err;
+        return false;
+    }
+
     return true;
 }
 
@@ -8573,10 +8625,11 @@ bool llama_model::unload_all_tensors(std::string & err_msg, size_t * bytes_freed
         *tensors_unloaded = 0;
     }
 
-    std::vector<std::string> names;
+    std::vector<size_t> indices;
     {
         std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
-        for (const auto & rec : pimpl->weight_records) {
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            const auto & rec = pimpl->weight_records[i];
             if (rec.state != impl::weight_state::ready) {
                 continue;
             }
@@ -8584,14 +8637,23 @@ bool llama_model::unload_all_tensors(std::string & err_msg, size_t * bytes_freed
                 LLAMA_LOG_INFO("%s: keeping tensor '%s' resident due to LLAMA_WEIGHT_UNLOAD_KEEP_REGEX\n", __func__, rec.name.c_str());
                 continue;
             }
-            names.push_back(rec.name);
+            indices.push_back(i);
         }
     }
 
-    for (const auto & name : names) {
+    for (size_t index : indices) {
         size_t freed = 0;
         std::string cur_err;
-        if (!unload_tensor(name.c_str(), cur_err, &freed)) {
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            if (!unload_tensor_by_index_locked(index, cur_err, &freed)) {
+                if (err_msg.empty()) {
+                    err_msg = cur_err;
+                }
+                continue;
+            }
+        }
+        if (!cur_err.empty()) {
             if (err_msg.empty()) {
                 err_msg = cur_err;
             }
@@ -8627,11 +8689,12 @@ bool llama_model::unload_tensor_fraction(float fraction, std::string & err_msg,
         *bytes_considered = 0;
     }
 
-    std::vector<std::pair<std::string, size_t>> candidates;
+    std::vector<std::pair<size_t, size_t>> candidates;
     size_t total = 0;
     {
         std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
-        for (const auto & rec : pimpl->weight_records) {
+        for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
+            const auto & rec = pimpl->weight_records[i];
             if (rec.state != impl::weight_state::ready) {
                 continue;
             }
@@ -8640,7 +8703,7 @@ bool llama_model::unload_tensor_fraction(float fraction, std::string & err_msg,
                 continue;
             }
             total += rec.nbytes;
-            candidates.emplace_back(rec.name, rec.nbytes);
+            candidates.emplace_back(i, rec.nbytes);
         }
     }
 
@@ -8656,11 +8719,14 @@ bool llama_model::unload_tensor_fraction(float fraction, std::string & err_msg,
         }
         size_t freed = 0;
         std::string cur_err;
-        if (!unload_tensor(candidate.first.c_str(), cur_err, &freed)) {
-            if (err_msg.empty()) {
-                err_msg = cur_err;
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            if (!unload_tensor_by_index_locked(candidate.first, cur_err, &freed)) {
+                if (err_msg.empty()) {
+                    err_msg = cur_err;
+                }
+                continue;
             }
-            continue;
         }
         selected += candidate.second;
         if (bytes_freed) {
@@ -8680,7 +8746,13 @@ bool llama_model::is_tensor_loaded(const char * name) const {
     if (it == pimpl->weight_by_name.end()) {
         return false;
     }
-    return pimpl->weight_records[it->second].state == impl::weight_state::ready;
+    for (size_t index : it->second) {
+        if (index >= pimpl->weight_records.size() ||
+            pimpl->weight_records[index].state != impl::weight_state::ready) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::vector<size_t> llama_model::weight_barrier_indices_for_locked(const std::vector<size_t> & seed_indices) const {
@@ -8748,7 +8820,8 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
         std::vector<ggml_tensor *> views;
         int layer = -1;
         bool host = false;
-        std::vector<uint8_t> staging;
+        size_t row_size = 0;
+        std::vector<std::pair<size_t, size_t>> ranges;
         std::string error;
     };
 
@@ -8783,29 +8856,37 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
                 return false;
             }
 
-            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(rec.buft, ggml_backend_buft_get_alloc_size(rec.buft, rec.tensor));
-            if (!buf) {
-                rec.state = impl::weight_state::failed;
-                rec.error = "failed to allocate concrete weight buffer";
-                err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
-                pimpl->weight_cv.notify_all();
-                return false;
+            const bool full_restore_from_partial =
+                rec.state == impl::weight_state::partial &&
+                llama_weight_is_token_embedding_name(rec.name) &&
+                !rec.partial_rows.empty();
+
+            ggml_backend_buffer_t buf = rec.tensor->weight_buffer;
+            if (buf == nullptr || rec.tensor->data == nullptr) {
+                buf = ggml_backend_buft_alloc_buffer(rec.buft, ggml_backend_buft_get_alloc_size(rec.buft, rec.tensor));
+                if (!buf) {
+                    rec.state = impl::weight_state::failed;
+                    rec.error = "failed to allocate concrete weight buffer";
+                    err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
+                    pimpl->weight_cv.notify_all();
+                    return false;
+                }
+                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+                rec.tensor->buffer = nullptr;
+                rec.tensor->weight_buffer = nullptr;
+                rec.tensor->data = nullptr;
+                ggml_backend_tensor_alloc(buf, rec.tensor, ggml_backend_buffer_get_base(buf));
+
+                for (ggml_tensor * view : rec.views) {
+                    view->buffer = nullptr;
+                    view->weight_buffer = nullptr;
+                    view->data = nullptr;
+                    ggml_backend_view_init(view);
+                }
+
+                pimpl->ctxs_bufs.at(rec.ctx_index).second.emplace_back(buf);
             }
-            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-            rec.tensor->buffer = nullptr;
-            rec.tensor->weight_buffer = nullptr;
-            rec.tensor->data = nullptr;
-            ggml_backend_tensor_alloc(buf, rec.tensor, ggml_backend_buffer_get_base(buf));
-
-            for (ggml_tensor * view : rec.views) {
-                view->buffer = nullptr;
-                view->weight_buffer = nullptr;
-                view->data = nullptr;
-                ggml_backend_view_init(view);
-            }
-
-            pimpl->ctxs_bufs.at(rec.ctx_index).second.emplace_back(buf);
             rec.state = impl::weight_state::loading;
             rec.error.clear();
 
@@ -8819,8 +8900,30 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
             item.views = rec.views;
             item.layer = rec.layer;
             item.host = ggml_backend_buffer_is_host(buf);
-            if (!item.host) {
-                item.staging.resize(item.nbytes);
+            item.ranges.emplace_back(0, item.nbytes);
+
+            if (full_restore_from_partial) {
+                item.row_size = ggml_row_size(item.tensor->type, item.tensor->ne[0]);
+                std::vector<llama_token> rows(rec.partial_rows.begin(), rec.partial_rows.end());
+                std::sort(rows.begin(), rows.end());
+                rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+
+                item.ranges.clear();
+                size_t cur = 0;
+                for (const llama_token row : rows) {
+                    if (row < 0 || row >= item.tensor->ne[1]) {
+                        continue;
+                    }
+                    const size_t row_begin = (size_t) row * item.row_size;
+                    const size_t row_end   = row_begin + item.row_size;
+                    if (cur < row_begin) {
+                        item.ranges.emplace_back(cur, row_begin - cur);
+                    }
+                    cur = std::max(cur, row_end);
+                }
+                if (cur < item.nbytes) {
+                    item.ranges.emplace_back(cur, item.nbytes - cur);
+                }
             }
             items.emplace_back(std::move(item));
         }
@@ -8966,8 +9069,23 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
 
         llama_weight_test_wait_file_gate();
 
+        {
+            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+            for (size_t item_index : group) {
+                auto & rec = pimpl->weight_records[items[item_index].index];
+                if (rec.state == impl::weight_state::loading) {
+                    rec.state = impl::weight_state::submitted;
+                }
+            }
+            pimpl->weight_cv.notify_all();
+        }
+
         std::atomic<size_t> next_item{0};
         std::atomic<int64_t> read_worker_us{0};
+        std::atomic<int64_t> upload_worker_us{0};
+        std::atomic<size_t> upload_batches{0};
+        std::mutex upload_mutex;
+        const size_t stream_chunk_size = llama_weight_stream_chunk_size();
         const int64_t t_read_start = ggml_time_us();
         std::vector<std::thread> workers;
         workers.reserve((size_t) queue_count);
@@ -8975,6 +9093,7 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
         for (int q = 0; q < queue_count; ++q) {
             workers.emplace_back([&, q] {
                 GGML_UNUSED(q);
+                std::vector<uint8_t> scratch;
                 while (true) {
                     const size_t group_pos = next_item.fetch_add(1);
                     if (group_pos >= group.size()) {
@@ -8982,19 +9101,50 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
                     }
 
                     auto & item = items[group[group_pos]];
-                    const int64_t t0 = ggml_time_us();
                     try {
                         llama_file file(item.file_path.c_str(), "rb", pimpl->weight_use_direct_io);
-                        if (pimpl->weight_use_direct_io) {
-                            file.seek(item.file_offs, SEEK_SET);
-                            file.read_raw(item.host ? item.tensor->data : item.staging.data(), item.nbytes);
-                        } else {
-                            file.read_raw_at(item.file_offs, item.host ? item.tensor->data : item.staging.data(), item.nbytes);
+                        for (const auto & range : item.ranges) {
+                            size_t range_done = 0;
+                            while (range_done < range.second) {
+                                const size_t tensor_offs = range.first + range_done;
+                                const size_t chunk = std::min(stream_chunk_size, range.second - range_done);
+                                void * dst = item.host ? (uint8_t *) item.tensor->data + tensor_offs : nullptr;
+                                uint8_t * src = nullptr;
+
+                                if (item.host) {
+                                    src = (uint8_t *) dst;
+                                } else {
+                                    if (scratch.size() < chunk) {
+                                        scratch.resize(chunk);
+                                    }
+                                    src = scratch.data();
+                                }
+
+                                const int64_t t_read0 = ggml_time_us();
+                                if (pimpl->weight_use_direct_io) {
+                                    file.seek(item.file_offs + tensor_offs, SEEK_SET);
+                                    file.read_raw(src, chunk);
+                                } else {
+                                    file.read_raw_at(item.file_offs + tensor_offs, src, chunk);
+                                }
+                                read_worker_us.fetch_add(ggml_time_us() - t_read0, std::memory_order_relaxed);
+
+                                if (!item.host) {
+                                    const int64_t t_upload0 = ggml_time_us();
+                                    {
+                                        std::lock_guard<std::mutex> upload_lock(upload_mutex);
+                                        ggml_backend_tensor_set(item.tensor, src, tensor_offs, chunk);
+                                    }
+                                    upload_worker_us.fetch_add(ggml_time_us() - t_upload0, std::memory_order_relaxed);
+                                    upload_batches.fetch_add(1, std::memory_order_relaxed);
+                                }
+
+                                range_done += chunk;
+                            }
                         }
                     } catch (const std::exception & ex) {
                         item.error = ex.what();
                     }
-                    read_worker_us.fetch_add(ggml_time_us() - t0, std::memory_order_relaxed);
                 }
             });
         }
@@ -9005,46 +9155,19 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
 
         group_metrics.read_wall_us = ggml_time_us() - t_read_start;
         group_metrics.read_worker_us = read_worker_us.load(std::memory_order_relaxed);
-
-        {
-            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
-            for (size_t item_index : group) {
-                auto & rec = pimpl->weight_records[items[item_index].index];
-                if (rec.state == impl::weight_state::loading) {
-                    rec.state = impl::weight_state::staged;
-                }
-            }
-            pimpl->weight_cv.notify_all();
-        }
-
-        const int64_t t_upload_start = ggml_time_us();
-        {
-            std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
-            for (size_t item_index : group) {
-                auto & rec = pimpl->weight_records[items[item_index].index];
-                if (rec.state == impl::weight_state::staged) {
-                    rec.state = impl::weight_state::submitted;
-                }
-            }
-            pimpl->weight_cv.notify_all();
-        }
+        group_metrics.upload_set_us = upload_worker_us.load(std::memory_order_relaxed);
+        group_metrics.upload_batches = upload_batches.load(std::memory_order_relaxed);
 
         for (size_t item_index : group) {
             auto & item = items[item_index];
-            group_metrics.read_bytes += item.nbytes;
             if (!item.error.empty()) {
                 continue;
             }
-
-            if (!item.host) {
-                ggml_backend_tensor_set(item.tensor, item.staging.data(), 0, item.nbytes);
-                group_metrics.upload_bytes += item.nbytes;
-                group_metrics.upload_batches++;
-            } else {
-                group_metrics.upload_bytes += item.nbytes;
+            for (const auto & range : item.ranges) {
+                group_metrics.read_bytes += range.second;
+                group_metrics.upload_bytes += range.second;
             }
         }
-        group_metrics.upload_set_us = ggml_time_us() - t_upload_start;
         group_metrics.ready_us = ggml_time_us() - t_group_start;
 
         {
@@ -9062,6 +9185,7 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
                 }
 
                 rec.state = impl::weight_state::ready;
+                rec.partial_rows.clear();
                 rec.error.clear();
             }
 
@@ -9114,12 +9238,199 @@ bool llama_model::ensure_tensors_ready(std::string & err_msg) {
     return restore_weight_indices(indices, err_msg, "ensure_all");
 }
 
+bool llama_model::ensure_token_embedding_rows_ready(const llama_token * tokens, size_t n_tokens, std::string & err_msg) {
+    if (!llama_weight_partial_embedding_enabled() || tokens == nullptr || n_tokens == 0) {
+        return true;
+    }
+
+    struct row_load {
+        ggml_tensor * tensor = nullptr;
+        std::string file_path;
+        size_t file_offs = 0;
+        size_t row_size = 0;
+        bool host = false;
+        std::vector<llama_token> rows;
+    };
+
+    row_load load;
+    size_t rec_index = SIZE_MAX;
+    const int64_t t_start = ggml_time_us();
+
+    {
+        std::unique_lock<std::mutex> lock(pimpl->weight_mutex);
+        auto it = pimpl->weight_by_name.find("token_embd.weight");
+        if (it == pimpl->weight_by_name.end()) {
+            return true;
+        }
+
+        for (size_t index : it->second) {
+            if (index < pimpl->weight_records.size() && pimpl->weight_records[index].tensor == tok_embd) {
+                rec_index = index;
+                break;
+            }
+        }
+        if (rec_index == SIZE_MAX) {
+            rec_index = it->second.front();
+        }
+        if (rec_index >= pimpl->weight_records.size()) {
+            return true;
+        }
+
+        auto & rec = pimpl->weight_records[rec_index];
+        while (rec.state == impl::weight_state::loading ||
+               rec.state == impl::weight_state::staged ||
+               rec.state == impl::weight_state::submitted) {
+            pimpl->weight_cv.wait(lock);
+        }
+        if (rec.state == impl::weight_state::ready) {
+            return true;
+        }
+
+        if (rec.file_idx >= pimpl->weight_file_paths.size() || pimpl->weight_file_paths[rec.file_idx].empty()) {
+            rec.state = impl::weight_state::failed;
+            rec.error = "source file path is unavailable";
+            err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
+            pimpl->weight_cv.notify_all();
+            return false;
+        }
+
+        ggml_backend_buffer_t buf = rec.tensor->weight_buffer;
+        if (buf == nullptr || rec.tensor->data == nullptr) {
+            buf = ggml_backend_buft_alloc_buffer(rec.buft, ggml_backend_buft_get_alloc_size(rec.buft, rec.tensor));
+            if (!buf) {
+                rec.state = impl::weight_state::failed;
+                rec.error = "failed to allocate concrete weight buffer";
+                err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
+                pimpl->weight_cv.notify_all();
+                return false;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            rec.tensor->buffer = nullptr;
+            rec.tensor->weight_buffer = nullptr;
+            rec.tensor->data = nullptr;
+            ggml_backend_tensor_alloc(buf, rec.tensor, ggml_backend_buffer_get_base(buf));
+
+            for (ggml_tensor * view : rec.views) {
+                view->buffer = nullptr;
+                view->weight_buffer = nullptr;
+                view->data = nullptr;
+                ggml_backend_view_init(view);
+            }
+
+            pimpl->ctxs_bufs.at(rec.ctx_index).second.emplace_back(buf);
+        }
+
+        load.tensor = rec.tensor;
+        load.file_path = pimpl->weight_file_paths[rec.file_idx];
+        load.file_offs = rec.file_offs;
+        load.row_size = ggml_row_size(rec.tensor->type, rec.tensor->ne[0]);
+        load.host = ggml_backend_buffer_is_host(buf);
+
+        for (size_t i = 0; i < n_tokens; ++i) {
+            const llama_token token = tokens[i];
+            if (token < 0 || token >= rec.tensor->ne[1]) {
+                continue;
+            }
+            if (rec.partial_rows.find(token) == rec.partial_rows.end()) {
+                load.rows.push_back(token);
+            }
+        }
+        std::sort(load.rows.begin(), load.rows.end());
+        load.rows.erase(std::unique(load.rows.begin(), load.rows.end()), load.rows.end());
+
+        if (load.rows.empty()) {
+            rec.state = impl::weight_state::partial;
+            pimpl->weight_cv.notify_all();
+            return true;
+        }
+
+        rec.state = impl::weight_state::loading;
+        rec.error.clear();
+        pimpl->weight_cv.notify_all();
+    }
+
+    impl::weight_restore_metrics metrics;
+    metrics.tensor_count = 1;
+    metrics.reload_group_count = 1;
+    metrics.queue_count = 1;
+
+    std::string read_error;
+    const int64_t t_read_start = ggml_time_us();
+    try {
+        llama_file file(load.file_path.c_str(), "rb", pimpl->weight_use_direct_io);
+        std::vector<uint8_t> scratch(load.host ? 0 : load.row_size);
+        for (const llama_token row : load.rows) {
+            const size_t tensor_offs = (size_t) row * load.row_size;
+            uint8_t * dst = load.host ? (uint8_t *) load.tensor->data + tensor_offs : scratch.data();
+
+            const int64_t t_read0 = ggml_time_us();
+            if (pimpl->weight_use_direct_io) {
+                file.seek(load.file_offs + tensor_offs, SEEK_SET);
+                file.read_raw(dst, load.row_size);
+            } else {
+                file.read_raw_at(load.file_offs + tensor_offs, dst, load.row_size);
+            }
+            metrics.read_worker_us += ggml_time_us() - t_read0;
+
+            if (!load.host) {
+                const int64_t t_upload0 = ggml_time_us();
+                ggml_backend_tensor_set(load.tensor, dst, tensor_offs, load.row_size);
+                metrics.upload_set_us += ggml_time_us() - t_upload0;
+                metrics.upload_batches++;
+            }
+            metrics.read_bytes += load.row_size;
+            metrics.upload_bytes += load.row_size;
+        }
+    } catch (const std::exception & ex) {
+        read_error = ex.what();
+    }
+    metrics.read_wall_us = ggml_time_us() - t_read_start;
+    metrics.ready_us = ggml_time_us() - t_start;
+
+    {
+        std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
+        if (rec_index >= pimpl->weight_records.size()) {
+            return true;
+        }
+        auto & rec = pimpl->weight_records[rec_index];
+        if (!read_error.empty()) {
+            rec.state = impl::weight_state::failed;
+            rec.error = read_error;
+            err_msg = format("tensor '%s': %s", rec.name.c_str(), rec.error.c_str());
+            pimpl->last_weight_metrics = metrics;
+            pimpl->weight_cv.notify_all();
+            return false;
+        }
+
+        rec.partial_rows.insert(load.rows.begin(), load.rows.end());
+        rec.state = impl::weight_state::partial;
+        rec.error.clear();
+        pimpl->last_weight_metrics = metrics;
+        pimpl->weight_epoch_value.fetch_add(1, std::memory_order_relaxed);
+        pimpl->weight_cv.notify_all();
+    }
+
+    if (pimpl->weight_micro_stats || llama_env_enabled("LLAMA_WEIGHT_LOAD_TRACE")) {
+        LLAMA_LOG_INFO(
+                "weight_load_trace: stage=embedding_partial group=token_embd rows=%zu ready=%.2fms read_wall=%.2fms read_worker=%.2fms upload_set=%.2fms read_bytes=%zu upload_bytes=%zu upload_batches=%zu\n",
+                load.rows.size(), metrics.ready_us / 1000.0, metrics.read_wall_us / 1000.0,
+                metrics.read_worker_us / 1000.0, metrics.upload_set_us / 1000.0,
+                metrics.read_bytes, metrics.upload_bytes, metrics.upload_batches);
+    }
+
+    return true;
+}
+
 bool llama_model::ensure_global_tensors_ready(std::string & err_msg) {
     std::vector<size_t> indices;
     {
         std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
         for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
             const auto & rec = pimpl->weight_records[i];
+            if (llama_weight_partial_embedding_enabled() && llama_weight_is_token_embedding_name(rec.name)) {
+                continue;
+            }
             if (rec.layer == -1 && rec.state != impl::weight_state::ready) {
                 indices.push_back(i);
             }
@@ -9149,11 +9460,16 @@ bool llama_model::ensure_layer_tensors_ready(int il, std::string & err_msg) {
 
 bool llama_model::ensure_output_tensors_ready(std::string & err_msg) {
     std::vector<size_t> indices;
+    const bool output_uses_token_embedding =
+        output == tok_embd ||
+        (output != nullptr && llama_weight_is_token_embedding_name(ggml_get_name(output)));
     {
         std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
         for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
             const auto & rec = pimpl->weight_records[i];
-            if (rec.layer == INT_MAX && rec.state != impl::weight_state::ready) {
+            const bool is_tied_embedding_output =
+                output_uses_token_embedding && llama_weight_is_token_embedding_name(rec.name);
+            if ((rec.layer == INT_MAX || is_tied_embedding_output) && rec.state != impl::weight_state::ready) {
                 indices.push_back(i);
             }
         }
@@ -9170,7 +9486,8 @@ void llama_model::prefetch_unloaded_tensors() {
         std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
         for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
             const auto & rec = pimpl->weight_records[i];
-            if (rec.state != impl::weight_state::unloaded) {
+            if (rec.state != impl::weight_state::unloaded &&
+                rec.state != impl::weight_state::partial) {
                 continue;
             }
             indices.push_back(i);
@@ -9197,7 +9514,8 @@ void llama_model::prefetch_unloaded_tensors() {
         pimpl->weight_cv.wait(lock, [&] {
             for (size_t index : indices) {
                 if (index < pimpl->weight_records.size() &&
-                    pimpl->weight_records[index].state == impl::weight_state::unloaded) {
+                    (pimpl->weight_records[index].state == impl::weight_state::unloaded ||
+                     pimpl->weight_records[index].state == impl::weight_state::partial)) {
                     return false;
                 }
             }
@@ -9224,6 +9542,7 @@ void llama_model::start_async_tensors_load() {
         std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
         for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
             if (pimpl->weight_records[i].state == impl::weight_state::unloaded ||
+                pimpl->weight_records[i].state == impl::weight_state::partial ||
                 pimpl->weight_records[i].state == impl::weight_state::failed) {
                 indices.push_back(i);
             }
@@ -9240,6 +9559,7 @@ void llama_model::start_async_tensors_load() {
             std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
             for (size_t i = 0; i < pimpl->weight_records.size(); ++i) {
                 if (pimpl->weight_records[i].state == impl::weight_state::unloaded ||
+                    pimpl->weight_records[i].state == impl::weight_state::partial ||
                     pimpl->weight_records[i].state == impl::weight_state::failed) {
                     indices.push_back(i);
                 }
@@ -9370,9 +9690,14 @@ std::vector<int> llama_model::unready_layer_indices() const {
 }
 
 bool llama_model::output_tensors_ready() const {
+    const bool output_uses_token_embedding =
+        output == tok_embd ||
+        (output != nullptr && llama_weight_is_token_embedding_name(ggml_get_name(output)));
     std::lock_guard<std::mutex> lock(pimpl->weight_mutex);
     for (const auto & rec : pimpl->weight_records) {
-        if (rec.layer == INT_MAX && rec.state != impl::weight_state::ready) {
+        const bool is_tied_embedding_output =
+            output_uses_token_embedding && llama_weight_is_token_embedding_name(rec.name);
+        if ((rec.layer == INT_MAX || is_tied_embedding_output) && rec.state != impl::weight_state::ready) {
             return false;
         }
     }

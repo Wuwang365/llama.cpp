@@ -1598,6 +1598,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     {
         std::string err;
         auto & mutable_model = const_cast<llama_model &>(model);
+        if (batch_inp.token && !mutable_model.ensure_token_embedding_rows_ready(batch_inp.token, (size_t) batch_inp.n_tokens, err)) {
+            LLAMA_LOG_ERROR("%s: failed to restore token embedding rows: %s\n", __func__, err.c_str());
+            return -3;
+        }
         if (!mutable_model.ensure_global_tensors_ready(err)) {
             LLAMA_LOG_ERROR("%s: failed to restore global weights: %s\n", __func__, err.c_str());
             return -3;
@@ -1948,6 +1952,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     {
         std::string err;
         auto & mutable_model = const_cast<llama_model &>(model);
+        if (batch_inp.token && !mutable_model.ensure_token_embedding_rows_ready(batch_inp.token, (size_t) batch_inp.n_tokens, err)) {
+            LLAMA_LOG_ERROR("%s: failed to restore token embedding rows: %s\n", __func__, err.c_str());
+            return -3;
+        }
         if (!mutable_model.ensure_global_tensors_ready(err)) {
             LLAMA_LOG_ERROR("%s: failed to restore global weights: %s\n", __func__, err.c_str());
             return -3;
