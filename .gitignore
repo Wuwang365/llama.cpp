@@ -140,6 +140,17 @@ poetry.toml
 /run-spec.sh
 /.ccache/
 
+# Local agent workspace
+/.codex
+/.codex/
+/PLAN.md
+/docs/superpowers/
+
+# Android/device experiment artifacts
+/android-results/
+/pkg-android-vulkan/
+/keepalive_strategy_summary.csv
+
 # IDE
 /*.code-workspace
 /.windsurf/

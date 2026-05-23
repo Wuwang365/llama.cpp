@@ -117,6 +117,58 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.verbosity > 1);
 
+    {
+        common_params mp_params;
+        argv = {"binary_name", "-m", "model.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mp_params, LLAMA_EXAMPLE_COMMON));
+        assert(mp_params.memory_pressure.enabled == false);
+        assert(mp_params.memory_pressure.path == "/proc/pressure/memory");
+        assert(mp_params.memory_pressure.interval_ms == 500);
+        assert(mp_params.memory_pressure.cooldown_ms == 1000);
+        assert(mp_params.memory_pressure.step_bytes == 128ull * 1024ull * 1024ull);
+        assert(mp_params.memory_pressure.max_fraction == 0.80);
+        assert(mp_params.drop_weight_file_cache_after_upload == false);
+    }
+
+    {
+        common_params mp_params;
+        argv = {
+            "binary_name",
+            "-m", "model.gguf",
+            "--memory-pressure-unload",
+            "--memory-pressure-path", "/tmp/pressure",
+            "--memory-pressure-interval-ms", "250",
+            "--memory-pressure-cooldown-ms", "750",
+            "--memory-pressure-step-mib", "64",
+            "--memory-pressure-max-fraction", "0.5",
+            "--memory-pressure-some-avg10-thold", "2.5",
+            "--memory-pressure-some-avg60-thold", "1.5",
+            "--memory-pressure-full-avg10-thold", "0.2",
+            "--memory-pressure-policy", "external-hint",
+            "--no-memory-pressure-protected-app-active",
+            "--memory-pressure-dry-run",
+            "--memory-pressure-log", "/tmp/policy.jsonl",
+            "--memory-pressure-keep-regex", "^token_embd",
+            "--drop-weight-file-cache-after-upload"
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mp_params, LLAMA_EXAMPLE_COMMON));
+        assert(mp_params.memory_pressure.enabled == true);
+        assert(mp_params.memory_pressure.path == "/tmp/pressure");
+        assert(mp_params.memory_pressure.interval_ms == 250);
+        assert(mp_params.memory_pressure.cooldown_ms == 750);
+        assert(mp_params.memory_pressure.step_bytes == 64ull * 1024ull * 1024ull);
+        assert(mp_params.memory_pressure.max_fraction == 0.5);
+        assert(mp_params.memory_pressure.some_avg10_thold == 2.5);
+        assert(mp_params.memory_pressure.some_avg60_thold == 1.5);
+        assert(mp_params.memory_pressure.full_avg10_thold == 0.2);
+        assert(mp_params.memory_pressure.policy == COMMON_MEMORY_PRESSURE_POLICY_EXTERNAL_HINT);
+        assert(mp_params.memory_pressure.protected_app_active == false);
+        assert(mp_params.memory_pressure.dry_run == true);
+        assert(mp_params.memory_pressure.log_path == "/tmp/policy.jsonl");
+        assert(mp_params.memory_pressure.keep_regex == "^token_embd");
+        assert(mp_params.drop_weight_file_cache_after_upload == true);
+    }
+
     argv = {"binary_name", "-m", "abc.gguf", "--predict", "6789", "--batch-size", "9090"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "abc.gguf");

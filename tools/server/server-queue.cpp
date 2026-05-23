@@ -127,6 +127,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     time_last_task = ggml_time_ms();
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
+    constexpr auto periodic_wait_time = std::chrono::milliseconds(100);
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
         if (idle_sleep_ms < 0) {
@@ -196,11 +197,16 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 break; // process new tasks
             } else {
                 // wait for new tasks or timeout for checking sleeping condition
-                bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+                bool res = condition_tasks.wait_for(lock, callback_periodic ? periodic_wait_time : max_wait_time, [&]{
                     return (!queue_tasks.empty() || !running);
                 });
                 if (res) {
                     break; // new task arrived or terminate
+                }
+                if (callback_periodic) {
+                    lock.unlock();
+                    callback_periodic();
+                    lock.lock();
                 }
                 // otherwise, loop again to check sleeping condition
             }

@@ -72,6 +72,8 @@ add_library(${TARGET} STATIC
     llguidance.cpp
     log.cpp
     log.h
+    memory-pressure.cpp
+    memory-pressure.h
     ngram-cache.cpp
     ngram-cache.h
     ngram-map.cpp

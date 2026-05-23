@@ -322,6 +322,7 @@ extern "C" {
         bool parallel_load;    // preload or restore weights on a background-capable path
         bool async_io_load;    // use explicit async IO queues for non-mmap weight loading
         bool load_micro_stats; // print fine-grained weight loading timing statistics
+        bool drop_weight_file_cache_after_upload; // best-effort fadvise(DONTNEED) after restored weight ranges are uploaded
     };
 
     struct llama_sampler_seq_config {

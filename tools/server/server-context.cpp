@@ -579,6 +579,8 @@ private:
 
     json json_webui_settings = json::object();
 
+    std::unique_ptr<common_memory_pressure_manager> memory_pressure;
+
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
 
@@ -589,6 +591,7 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        memory_pressure.reset();
         llama_init.reset();
         ctx = nullptr;
         model = nullptr;
@@ -603,6 +606,13 @@ private:
         }
 
         llama_batch_free(batch);
+    }
+
+    void tick_memory_pressure(bool busy) {
+        if (memory_pressure && !sleeping && model != nullptr) {
+            std::string err;
+            memory_pressure->tick(busy, &err);
+        }
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -653,6 +663,12 @@ private:
         }
 
         vocab = llama_model_get_vocab(model);
+
+        if (params_base.memory_pressure.enabled) {
+            memory_pressure = std::make_unique<common_memory_pressure_manager>(params_base.memory_pressure, model);
+        } else {
+            memory_pressure.reset();
+        }
 
         n_ctx = llama_n_ctx(ctx);
 
@@ -872,6 +888,11 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+        if (params_base.memory_pressure.enabled) {
+            queue_tasks.on_periodic([this]() {
+                tick_memory_pressure(false);
+            });
+        }
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
@@ -2000,10 +2021,12 @@ private:
 
             if (all_idle) {
                 SRV_INF("%s", "all slots are idle\n");
+                tick_memory_pressure(false);
 
                 return;
             }
         }
+        tick_memory_pressure(true);
 
         {
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");

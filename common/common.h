@@ -5,6 +5,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama-cpp.h"
+#include "memory-pressure.h"
 
 #include <set>
 #include <sstream>
@@ -540,6 +541,8 @@ struct common_params {
     bool load_micro_stats  = false; // print fine-grained model weight loading stats
     bool unload_all_after_load = false; // unload model weights after initial load
     float unload_after_load_fraction = 0.0f; // unload this fraction of model weight bytes after load
+    bool drop_weight_file_cache_after_upload = false; // best-effort POSIX_FADV_DONTNEED after weight restore reads
+    common_memory_pressure_config memory_pressure;
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

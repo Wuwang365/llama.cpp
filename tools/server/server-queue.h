@@ -28,6 +28,7 @@ private:
     // callback functions
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
+    std::function<void(void)>           callback_periodic;
     std::function<void(bool)>           callback_sleeping_state;
 
 public:
@@ -93,6 +94,11 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register a callback that is called from the main loop while waiting for work.
+    void on_periodic(std::function<void(void)> callback) {
+        callback_periodic = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

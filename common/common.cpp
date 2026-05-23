@@ -1443,6 +1443,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.parallel_load   = params.parallel_load;
     mparams.async_io_load   = params.async_io_load;
     mparams.load_micro_stats = params.load_micro_stats;
+    mparams.drop_weight_file_cache_after_upload = params.drop_weight_file_cache_after_upload;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

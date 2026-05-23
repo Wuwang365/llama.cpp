@@ -31,9 +31,11 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <atomic>
 #include <condition_variable>
+#include <fcntl.h>
 #include <mutex>
 #include <numeric>
 #include <regex>
@@ -711,6 +713,7 @@ struct llama_model::impl {
     std::vector<std::string> weight_file_paths;
     bool weight_use_direct_io = false;
     bool weight_micro_stats = false;
+    bool drop_weight_file_cache_after_upload = false;
     std::thread lazy_load_thread;
     weight_restore_metrics last_weight_metrics;
 
@@ -765,6 +768,22 @@ static bool llama_tensor_name_matches_env_regex(const char * env_name, const std
         });
         return false;
     }
+}
+
+static void llama_weight_fadvise_dontneed(const llama_file & file, size_t offset, size_t len, bool enabled, bool direct_io) {
+    if (!enabled || direct_io || len == 0) {
+        return;
+    }
+#if defined(POSIX_FADV_DONTNEED)
+    if (offset > (size_t) std::numeric_limits<off_t>::max() || len > (size_t) std::numeric_limits<off_t>::max()) {
+        return;
+    }
+    (void) posix_fadvise(file.file_id(), (off_t) offset, (off_t) len, POSIX_FADV_DONTNEED);
+#else
+    GGML_UNUSED(file);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(len);
+#endif
 }
 
 static int llama_env_i32(const char * name, int fallback, int lo, int hi) {
@@ -8433,6 +8452,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         pimpl->weight_file_paths = ml.file_paths;
         pimpl->weight_use_direct_io = ml.use_direct_io;
         pimpl->weight_micro_stats = params.load_micro_stats;
+        pimpl->drop_weight_file_cache_after_upload = params.drop_weight_file_cache_after_upload;
 
         for (size_t ctx_index = 0; ctx_index < pimpl->ctxs_bufs.size(); ++ctx_index) {
             auto * ctx = pimpl->ctxs_bufs[ctx_index].first.get();
@@ -9141,6 +9161,12 @@ bool llama_model::restore_weight_indices(const std::vector<size_t> & indices, st
 
                                 range_done += chunk;
                             }
+                            llama_weight_fadvise_dontneed(
+                                    file,
+                                    item.file_offs + range.first,
+                                    range.second,
+                                    pimpl->drop_weight_file_cache_after_upload,
+                                    pimpl->weight_use_direct_io);
                         }
                     } catch (const std::exception & ex) {
                         item.error = ex.what();
@@ -9381,6 +9407,12 @@ bool llama_model::ensure_token_embedding_rows_ready(const llama_token * tokens, 
             }
             metrics.read_bytes += load.row_size;
             metrics.upload_bytes += load.row_size;
+            llama_weight_fadvise_dontneed(
+                    file,
+                    load.file_offs + tensor_offs,
+                    load.row_size,
+                    pimpl->drop_weight_file_cache_after_upload,
+                    pimpl->weight_use_direct_io);
         }
     } catch (const std::exception & ex) {
         read_error = ex.what();
@@ -10824,6 +10856,7 @@ llama_model_params llama_model_default_params() {
         /*.parallel_load               =*/ false,
         /*.async_io_load               =*/ false,
         /*.load_micro_stats            =*/ false,
+        /*.drop_weight_file_cache_after_upload =*/ false,
     };
 
     return result;

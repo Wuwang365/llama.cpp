@@ -237,7 +237,16 @@ set_tests_properties(test-weight-unload PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build_and_test(test-parallel-load.cpp ARGS "${MODEL_DEST}")
 set_tests_properties(test-parallel-load PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+llama_build_and_test(test-memory-pressure.cpp)
 llama_build_and_test(test-arg-parser.cpp)
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME test-build-vulkan-pixel-verify
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-build-vulkan-pixel-verify.sh
+    )
+endif()
 llama_build_and_test(test-weight-buffer.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)

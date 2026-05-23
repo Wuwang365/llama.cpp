@@ -2264,6 +2264,129 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UNLOAD_AFTER_LOAD_FRACTION"));
     add_opt(common_arg(
+        {"--memory-pressure-unload"},
+        {"--no-memory-pressure-unload"},
+        string_format("whether to enable memory-pressure-driven model weight unloading. (default: %s)", params.memory_pressure.enabled ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.memory_pressure.enabled = value;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_UNLOAD"));
+    add_opt(common_arg(
+        {"--memory-pressure-path"}, "PATH",
+        "path to Linux PSI memory pressure file",
+        [](common_params & params, const std::string & value) {
+            params.memory_pressure.path = value;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_PATH"));
+    add_opt(common_arg(
+        {"--memory-pressure-interval-ms"}, "N",
+        "minimum interval between memory pressure policy ticks",
+        [](common_params & params, const std::string & value) {
+            int v = std::stoi(value);
+            if (v <= 0) { throw std::invalid_argument("invalid value"); }
+            params.memory_pressure.interval_ms = v;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_INTERVAL_MS"));
+    add_opt(common_arg(
+        {"--memory-pressure-cooldown-ms"}, "N",
+        "cooldown after a memory pressure unload decision",
+        [](common_params & params, const std::string & value) {
+            int v = std::stoi(value);
+            if (v < 0) { throw std::invalid_argument("invalid value"); }
+            params.memory_pressure.cooldown_ms = v;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_COOLDOWN_MS"));
+    add_opt(common_arg(
+        {"--memory-pressure-step-mib"}, "N",
+        "target MiB to unload per memory pressure step",
+        [](common_params & params, const std::string & value) {
+            const uint64_t mib = std::stoull(value);
+            if (mib == 0) { throw std::invalid_argument("invalid value"); }
+            params.memory_pressure.step_bytes = (size_t) mib * 1024ull * 1024ull;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_STEP_MIB"));
+    add_opt(common_arg(
+        {"--memory-pressure-max-fraction"}, "F",
+        "maximum fraction of model weight bytes that the memory pressure policy may unload",
+        [](common_params & params, const std::string & value) {
+            const double v = std::stod(value);
+            if (v < 0.0 || v > 1.0) { throw std::invalid_argument("invalid value"); }
+            params.memory_pressure.max_fraction = v;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_MAX_FRACTION"));
+    add_opt(common_arg(
+        {"--memory-pressure-some-avg10-thold"}, "F",
+        "PSI some.avg10 threshold for memory pressure unloading",
+        [](common_params & params, const std::string & value) {
+            params.memory_pressure.some_avg10_thold = std::stod(value);
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_SOME_AVG10_THOLD"));
+    add_opt(common_arg(
+        {"--memory-pressure-some-avg60-thold"}, "F",
+        "PSI some.avg60 threshold for high memory pressure",
+        [](common_params & params, const std::string & value) {
+            params.memory_pressure.some_avg60_thold = std::stod(value);
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_SOME_AVG60_THOLD"));
+    add_opt(common_arg(
+        {"--memory-pressure-full-avg10-thold"}, "F",
+        "PSI full.avg10 threshold for critical memory pressure",
+        [](common_params & params, const std::string & value) {
+            params.memory_pressure.full_avg10_thold = std::stod(value);
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_FULL_AVG10_THOLD"));
+    add_opt(common_arg(
+        {"--memory-pressure-policy"}, "pressure-only|external-hint",
+        "memory pressure policy mode",
+        [](common_params & params, const std::string & value) {
+            if (value == "pressure-only") {
+                params.memory_pressure.policy = COMMON_MEMORY_PRESSURE_POLICY_PRESSURE_ONLY;
+            } else if (value == "external-hint") {
+                params.memory_pressure.policy = COMMON_MEMORY_PRESSURE_POLICY_EXTERNAL_HINT;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_POLICY"));
+    add_opt(common_arg(
+        {"--memory-pressure-protected-app-active"},
+        {"--no-memory-pressure-protected-app-active"},
+        string_format("whether the external protected-app hint is active. (default: %s)", params.memory_pressure.protected_app_active ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.memory_pressure.protected_app_active = value;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_PROTECTED_APP_ACTIVE"));
+    add_opt(common_arg(
+        {"--memory-pressure-dry-run"},
+        {"--no-memory-pressure-dry-run"},
+        string_format("whether to log memory pressure unload decisions without unloading tensors. (default: %s)", params.memory_pressure.dry_run ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.memory_pressure.dry_run = value;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_DRY_RUN"));
+    add_opt(common_arg(
+        {"--memory-pressure-log"}, "PATH",
+        "write memory pressure policy events as JSONL",
+        [](common_params & params, const std::string & value) {
+            params.memory_pressure.log_path = value;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_LOG"));
+    add_opt(common_arg(
+        {"--memory-pressure-keep-regex"}, "REGEX",
+        "regex for tensors kept resident by the memory pressure policy",
+        [](common_params & params, const std::string & value) {
+            params.memory_pressure.keep_regex = value;
+        }
+    ).set_env("LLAMA_ARG_MEMORY_PRESSURE_KEEP_REGEX"));
+    add_opt(common_arg(
+        {"--drop-weight-file-cache-after-upload"},
+        {"--no-drop-weight-file-cache-after-upload"},
+        string_format("whether to best-effort drop restored weight file pages after upload. (default: %s)", params.drop_weight_file_cache_after_upload ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.drop_weight_file_cache_after_upload = value;
+        }
+    ).set_env("LLAMA_ARG_DROP_WEIGHT_FILE_CACHE_AFTER_UPLOAD"));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),
