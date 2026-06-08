@@ -909,8 +909,12 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     return buft_list;
 }
 
+using ggml_backend_vk_managed_buffer_type_t = ggml_backend_buffer_type_t (*)(ggml_backend_dev_t dev, size_t cache_size, bool eager);
+
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
-static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
+static buft_list_t make_gpu_buft_list(
+        ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split,
+        bool vulkan_managed_weights, size_t vulkan_managed_cache_size, bool vulkan_managed_eager) {
     buft_list_t buft_list;
 
     // add the device split buffer type if requested and available
@@ -930,6 +934,20 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             }();
             auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
             if (buft != nullptr) {
+                buft_list.emplace_back(dev, buft);
+            }
+        }
+    }
+
+    // add Vulkan managed weight buffer type before the default device buffer type
+    if (vulkan_managed_weights) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto ggml_backend_vk_managed_buffer_type_fn = reg
+            ? (ggml_backend_vk_managed_buffer_type_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_managed_buffer_type")
+            : nullptr;
+        if (ggml_backend_vk_managed_buffer_type_fn) {
+            ggml_backend_buffer_type_t buft = ggml_backend_vk_managed_buffer_type_fn(dev, vulkan_managed_cache_size, vulkan_managed_eager);
+            if (buft) {
                 buft_list.emplace_back(dev, buft);
             }
         }
@@ -1204,10 +1222,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
+    if (params.vulkan_managed_weights && !ml.use_mmap) {
+        throw std::runtime_error("Vulkan managed weights require mmap; enable use_mmap and disable direct_io");
+    }
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
+        buft_list_t buft_list = make_gpu_buft_list(
+            dev.dev, split_mode, tensor_split,
+            params.vulkan_managed_weights, params.vulkan_managed_cache_size, params.vulkan_managed_eager);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
@@ -1266,8 +1290,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // normally there is very little benefit to offloading the input layer, so keep it on CPU;
+    // managed Vulkan mode keeps token embeddings resident by default, so place the input layer on the first GPU.
+    if (params.vulkan_managed_weights && !devices.empty()) {
+        auto * dev = devices.front().dev;
+        pimpl->dev_input = { dev, &pimpl->gpu_buft_list.at(dev) };
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
@@ -1586,7 +1616,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.vulkan_managed_weights,
+                    params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
@@ -2196,6 +2227,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.vulkan_managed_cache_size   =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -2207,6 +2239,8 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.vulkan_managed_weights      =*/ false,
+        /*.vulkan_managed_eager        =*/ false,
     };
 
     return result;

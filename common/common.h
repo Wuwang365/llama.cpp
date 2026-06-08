@@ -559,6 +559,9 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    bool vk_managed_weights = false; // use Vulkan managed weight buffers
+    bool vk_managed_eager   = false; // eager materialize Vulkan managed weights at graph start
+    size_t vk_managed_cache_size = 0; // Vulkan managed weight cache size in bytes, 0 = unlimited
 
     bool single_turn       = false; // single turn chat conversation
 

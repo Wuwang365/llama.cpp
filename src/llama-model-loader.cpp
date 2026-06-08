@@ -1407,6 +1407,7 @@ bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
         llama_mlocks * lmlocks,
+        bool keep_mmap_backing,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
     if (files.empty()) {
@@ -1560,6 +1561,11 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (keep_mmap_backing) {
+                    auto & mmap_used = mmaps_used[weight->idx];
+                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                    mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);

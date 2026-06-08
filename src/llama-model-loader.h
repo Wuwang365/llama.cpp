@@ -198,6 +198,7 @@ struct llama_model_loader {
             struct ggml_context * ctx,
             llama_buf_map & bufs,
             llama_mlocks * lmlocks,
+            bool keep_mmap_backing,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
 

@@ -2269,6 +2269,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MMAP"));
     add_opt(common_arg(
+        {"--vk-managed"},
+        "use Vulkan managed weight buffers backed by mmaped GGUF bytes (experimental)",
+        [](common_params & params) {
+            params.vk_managed_weights = true;
+        }
+    ).set_env("LLAMA_ARG_VK_MANAGED"));
+    add_opt(common_arg(
+        {"--vk-managed-eager"},
+        "eagerly materialize Vulkan managed weights at graph start instead of per-op acquire (experimental)",
+        [](common_params & params) {
+            params.vk_managed_weights = true;
+            params.vk_managed_eager = true;
+        }
+    ).set_env("LLAMA_ARG_VK_MANAGED_EAGER"));
+    add_opt(common_arg(
+        {"--vk-managed-cache"}, "N",
+        "set Vulkan managed weight device cache size in MiB (0 = unlimited, experimental)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("vk-managed-cache must be non-negative");
+            }
+            params.vk_managed_weights = true;
+            params.vk_managed_cache_size = (size_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_VK_MANAGED_CACHE"));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),

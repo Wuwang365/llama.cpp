@@ -304,6 +304,11 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // Vulkan managed weight cache [EXPERIMENTAL].
+        // When enabled, Vulkan weights are backed by mmaped GGUF bytes and materialized into a device cache.
+        // cache size is in bytes; 0 means no explicit limit.
+        size_t vulkan_managed_cache_size;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.
@@ -324,6 +329,9 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+
+        bool vulkan_managed_weights; // use Vulkan managed weight buffers [EXPERIMENTAL]
+        bool vulkan_managed_eager;   // eager materialize managed weights at graph start; otherwise acquire per op
     };
 
     struct llama_sampler_seq_config {
