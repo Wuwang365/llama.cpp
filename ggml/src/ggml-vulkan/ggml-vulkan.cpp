@@ -317,7 +317,7 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx);
 static void ggml_vk_ctx_end(vk_context& ctx);
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+static constexpr uint32_t mul_mat_vec_max_cols = 64;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
@@ -7270,6 +7270,11 @@ static bool ggml_vk_managed_stats_enabled() {
     return getenv("GGML_VK_MANAGED_STATS") != nullptr || getenv("GGML_VK_MANAGED_DEBUG") != nullptr;
 }
 
+static bool ggml_vk_managed_flush_non_permanent_enabled() {
+    const char * env = getenv("GGML_VK_MANAGED_FLUSH_NON_PERMANENT");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
 static size_t ggml_vk_managed_parse_mib_env(
         const char * name,
         size_t default_limit) {
@@ -7472,6 +7477,111 @@ static void ggml_vk_managed_evict_entry(ggml_backend_vk_managed_buffer_context *
     entry.resident = false;
     entry.backing_released = false;
     mctx->stats_evictions++;
+}
+
+enum ggml_vk_managed_unload_result {
+    GGML_VK_MANAGED_UNLOAD_SUCCESS = 0,
+    GGML_VK_MANAGED_UNLOAD_NOT_MANAGED,
+    GGML_VK_MANAGED_UNLOAD_NOT_RESIDENT,
+    GGML_VK_MANAGED_UNLOAD_BUSY,
+    GGML_VK_MANAGED_UNLOAD_ERROR,
+};
+
+static bool ggml_backend_vk_managed_buffer_is_managed_tensor(const ggml_tensor * tensor) {
+    return ggml_vk_tensor_is_managed(tensor);
+}
+
+static int ggml_backend_vk_managed_buffer_unload_tensor(ggml_tensor * tensor) {
+    if (!tensor || !ggml_vk_tensor_is_managed(tensor)) {
+        return GGML_VK_MANAGED_UNLOAD_NOT_MANAGED;
+    }
+
+    auto * mctx = ggml_vk_managed_context(tensor);
+    const uint64_t key = ggml_vk_managed_tensor_key(tensor);
+
+    auto it = mctx->entries.find(key);
+    if (it == mctx->entries.end()) {
+        return GGML_VK_MANAGED_UNLOAD_NOT_MANAGED;
+    }
+
+    auto & entry = it->second;
+    if (entry.in_use || entry.preparing || entry.uploading) {
+        return GGML_VK_MANAGED_UNLOAD_BUSY;
+    }
+    if (!entry.resident) {
+        return GGML_VK_MANAGED_UNLOAD_NOT_RESIDENT;
+    }
+
+    mctx->cache_used -= entry.nbytes;
+    ggml_vk_destroy_buffer(entry.dev_buffer);
+    entry.dev_buffer = nullptr;
+    entry.upload_staging_slots.clear();
+    entry.upload_staging_bytes = 0;
+    entry.resident = false;
+    entry.backing_released = false;
+    mctx->stats_evictions++;
+
+    return GGML_VK_MANAGED_UNLOAD_SUCCESS;
+}
+
+static void ggml_vk_managed_flush_non_permanent(ggml_backend_vk_context * ctx) {
+    if (!ggml_vk_managed_flush_non_permanent_enabled() || !ctx->managed_graph_active) {
+        return;
+    }
+
+    // Make sure no previous upload/compute still owns buffers before destroying them.
+    ggml_vk_synchronize(ctx);
+    ggml_vk_managed_finalize_graph_uploads(ctx, true);
+
+    size_t flushed_tensors = 0;
+    size_t skipped_tensors = 0;
+    size_t kept_tensors = 0;
+    size_t flushed_bytes = 0;
+    size_t kept_bytes = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+        std::set<ggml_backend_vk_managed_buffer_context *> seen;
+        for (auto * mctx : ctx->managed_graph_contexts) {
+            if (!mctx || !seen.insert(mctx).second) {
+                continue;
+            }
+            for (auto & item : mctx->entries) {
+                auto & entry = item.second;
+                if (!entry.resident) {
+                    continue;
+                }
+                if (entry.permanent) {
+                    kept_tensors++;
+                    kept_bytes += entry.nbytes;
+                    continue;
+                }
+                if (entry.in_use || entry.preparing || entry.uploading) {
+                    skipped_tensors++;
+                    continue;
+                }
+
+                mctx->cache_used -= entry.nbytes;
+                flushed_bytes += entry.nbytes;
+                flushed_tensors++;
+                ggml_vk_destroy_buffer(entry.dev_buffer);
+                entry.dev_buffer = nullptr;
+                entry.upload_staging_slots.clear();
+                entry.upload_staging_bytes = 0;
+                entry.resident = false;
+                entry.backing_released = false;
+                mctx->stats_evictions++;
+            }
+        }
+    }
+
+    GGML_LOG_INFO(
+        "ggml_vulkan: managed flush non-permanent flushed=%zu tensors %.2f MiB kept=%zu tensors %.2f MiB skipped=%zu\n",
+        flushed_tensors,
+        (double) flushed_bytes / (1024.0 * 1024.0),
+        kept_tensors,
+        (double) kept_bytes / (1024.0 * 1024.0),
+        skipped_tensors);
 }
 
 static void ggml_vk_managed_ensure_capacity(ggml_backend_vk_managed_buffer_context * mctx, size_t nbytes) {
@@ -7857,6 +7967,8 @@ static void ggml_vk_managed_prepare_graph(ggml_backend_vk_context * ctx, const g
     if (!ctx->managed_graph_active) {
         return;
     }
+
+    ggml_vk_managed_flush_non_permanent(ctx);
 
     ctx->managed_per_op_acquire = !all_managed_eager;
     if (ctx->managed_per_op_acquire) {
@@ -18658,6 +18770,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     UNUSED(reg);
     if (strcmp(name, "ggml_backend_vk_managed_buffer_type") == 0) {
         return (void *) ggml_backend_vk_managed_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_vk_managed_buffer_is_managed_tensor") == 0) {
+        return (void *) ggml_backend_vk_managed_buffer_is_managed_tensor;
+    }
+    if (strcmp(name, "ggml_backend_vk_managed_buffer_unload_tensor") == 0) {
+        return (void *) ggml_backend_vk_managed_buffer_unload_tensor;
     }
     return nullptr;
 }

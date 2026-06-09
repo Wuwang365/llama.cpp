@@ -18,6 +18,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -2600,6 +2601,76 @@ bool llama_model_is_hybrid(const llama_model * model) {
 
 bool llama_model_is_diffusion(const llama_model * model) {
     return llm_arch_is_diffusion(model->arch);
+}
+
+int32_t llama_model_weight_count(const llama_model * model) {
+    if (!model) {
+        return 0;
+    }
+    return (int32_t) model->tensors_by_name.size();
+}
+
+int32_t llama_model_weight_name(const llama_model * model, int32_t index, char * buf, size_t buf_size) {
+    if (!model || index < 0 || index >= (int32_t) model->tensors_by_name.size()) {
+        if (buf && buf_size > 0) {
+            buf[0] = '\0';
+        }
+        return -1;
+    }
+
+    const std::string & name = model->tensors_by_name[index].first;
+    if (buf && buf_size > 0) {
+        const size_t n = std::min(buf_size - 1, name.size());
+        memcpy(buf, name.data(), n);
+        buf[n] = '\0';
+    }
+    return (int32_t) name.size();
+}
+
+using ggml_backend_vk_managed_buffer_is_managed_tensor_t = bool (*)(const ggml_tensor * tensor);
+using ggml_backend_vk_managed_buffer_unload_tensor_t = int (*)(ggml_tensor * tensor);
+
+enum llama_weight_unload_result llama_model_unload_weight(llama_model * model, const char * name) {
+    if (!model || !name || name[0] == '\0') {
+        return LLAMA_WEIGHT_UNLOAD_NOT_FOUND;
+    }
+
+    ggml_tensor * tensor = nullptr;
+    for (const auto & item : model->tensors_by_name) {
+        if (item.first == name) {
+            tensor = item.second;
+            break;
+        }
+    }
+    if (!tensor) {
+        return LLAMA_WEIGHT_UNLOAD_NOT_FOUND;
+    }
+
+    auto * reg = ggml_backend_reg_by_name("Vulkan");
+    if (!reg) {
+        return LLAMA_WEIGHT_UNLOAD_NOT_MANAGED;
+    }
+
+    auto * is_managed_fn = (ggml_backend_vk_managed_buffer_is_managed_tensor_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_managed_buffer_is_managed_tensor");
+    auto * unload_fn = (ggml_backend_vk_managed_buffer_unload_tensor_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_managed_buffer_unload_tensor");
+    if (!is_managed_fn || !unload_fn || !is_managed_fn(tensor)) {
+        return LLAMA_WEIGHT_UNLOAD_NOT_MANAGED;
+    }
+
+    switch (unload_fn(tensor)) {
+        case 0:
+            return LLAMA_WEIGHT_UNLOAD_SUCCESS;
+        case 2:
+            return LLAMA_WEIGHT_UNLOAD_NOT_RESIDENT;
+        case 3:
+            return LLAMA_WEIGHT_UNLOAD_BUSY;
+        case 1:
+            return LLAMA_WEIGHT_UNLOAD_NOT_MANAGED;
+        default:
+            return LLAMA_WEIGHT_UNLOAD_ERROR;
+    }
 }
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {

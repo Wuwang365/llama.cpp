@@ -72,6 +72,10 @@ struct server_context {
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
 
+    // get the loaded model, can return nullptr if no model is loaded
+    // not thread-safe, should only be used from the main thread or while idle
+    llama_model * get_llama_model() const;
+
     // get a new response reader, used by CLI application
     server_response_reader get_response_reader();
 
@@ -102,6 +106,8 @@ struct server_routes {
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
+    server_http_context::handler_t get_list_weights;
+    server_http_context::handler_t post_unload_weight;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;

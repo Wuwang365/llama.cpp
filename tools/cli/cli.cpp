@@ -224,15 +224,35 @@ struct cli_context {
 };
 
 // TODO?: Make this reusable, enums, docs
-static const std::array<std::string_view, 7> cmds = {
+static const std::array<std::string_view, 9> cmds = {
     "/audio ",
     "/clear",
     "/exit",
     "/glob ",
     "/image ",
+    "/list_weights",
     "/read ",
     "/regen",
+    "/unload_weight ",
 };
+
+static const char * weight_unload_result_str(enum llama_weight_unload_result result) {
+    switch (result) {
+        case LLAMA_WEIGHT_UNLOAD_SUCCESS:
+            return "unloaded";
+        case LLAMA_WEIGHT_UNLOAD_NOT_FOUND:
+            return "not found";
+        case LLAMA_WEIGHT_UNLOAD_NOT_MANAGED:
+            return "not managed";
+        case LLAMA_WEIGHT_UNLOAD_NOT_RESIDENT:
+            return "not resident";
+        case LLAMA_WEIGHT_UNLOAD_BUSY:
+            return "busy";
+        case LLAMA_WEIGHT_UNLOAD_ERROR:
+            return "error";
+    }
+    return "error";
+}
 
 static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std::string_view line, size_t cursor_byte_pos) {
     std::vector<std::pair<std::string, size_t>> matches;
@@ -436,6 +456,8 @@ int llama_cli(int argc, char ** argv) {
     console::log("  /exit or Ctrl+C     stop or exit\n");
     console::log("  /regen              regenerate the last response\n");
     console::log("  /clear              clear the chat history\n");
+    console::log("  /list_weights       list model weight names\n");
+    console::log("  /unload_weight <name> release a managed resident weight\n");
     console::log("  /read <file>        add a text file\n");
     console::log("  /glob <pattern>     add text files using globbing pattern\n");
     if (inf.has_inp_image) {
@@ -537,6 +559,56 @@ int llama_cli(int argc, char ** argv) {
 
             ctx_cli.input_files.clear();
             console::log("Chat history cleared.\n");
+            continue;
+        } else if (string_strip(buffer) == "/list_weights") {
+            llama_model * model = ctx_cli.ctx_server.get_llama_model();
+            if (model == nullptr) {
+                console::error("No model is loaded.\n");
+                continue;
+            }
+
+            const int32_t n_weights = llama_model_weight_count(model);
+            for (int32_t i = 0; i < n_weights; ++i) {
+                const int32_t len = llama_model_weight_name(model, i, nullptr, 0);
+                if (len <= 0) {
+                    continue;
+                }
+
+                std::vector<char> name((size_t) len + 1);
+                if (llama_model_weight_name(model, i, name.data(), name.size()) > 0) {
+                    console::log("%s\n", name.data());
+                }
+            }
+            console::log("Listed %d weights.\n", n_weights);
+            continue;
+        } else if (buffer == "/unload_weight" || string_starts_with(buffer, "/unload_weight ")) {
+            llama_model * model = ctx_cli.ctx_server.get_llama_model();
+            if (model == nullptr) {
+                console::error("No model is loaded.\n");
+                continue;
+            }
+
+            const std::string name = string_strip(buffer.substr(sizeof("/unload_weight") - 1));
+            if (name.empty()) {
+                console::error("Usage: /unload_weight <weight_name>\n");
+                continue;
+            }
+
+            const enum llama_weight_unload_result result = llama_model_unload_weight(model, name.c_str());
+            switch (result) {
+                case LLAMA_WEIGHT_UNLOAD_SUCCESS:
+                    console::log("Unloaded weight: %s\n", name.c_str());
+                    break;
+                case LLAMA_WEIGHT_UNLOAD_NOT_RESIDENT:
+                    console::log("Weight is already not resident: %s\n", name.c_str());
+                    break;
+                case LLAMA_WEIGHT_UNLOAD_NOT_FOUND:
+                case LLAMA_WEIGHT_UNLOAD_NOT_MANAGED:
+                case LLAMA_WEIGHT_UNLOAD_BUSY:
+                case LLAMA_WEIGHT_UNLOAD_ERROR:
+                    console::error("Failed to unload weight '%s': %s\n", name.c_str(), weight_unload_result_str(result));
+                    break;
+            }
             continue;
         } else if (
                 (string_starts_with(buffer, "/image ") && inf.has_inp_image) ||

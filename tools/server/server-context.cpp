@@ -3558,6 +3558,10 @@ llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
 
+llama_model * server_context::get_llama_model() const {
+    return impl->model_tgt;
+}
+
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
 }
@@ -3943,6 +3947,76 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
 
+static const char * server_weight_unload_result_str(enum llama_weight_unload_result result) {
+    switch (result) {
+        case LLAMA_WEIGHT_UNLOAD_SUCCESS:
+            return "unloaded";
+        case LLAMA_WEIGHT_UNLOAD_NOT_FOUND:
+            return "not_found";
+        case LLAMA_WEIGHT_UNLOAD_NOT_MANAGED:
+            return "not_managed";
+        case LLAMA_WEIGHT_UNLOAD_NOT_RESIDENT:
+            return "not_resident";
+        case LLAMA_WEIGHT_UNLOAD_BUSY:
+            return "busy";
+        case LLAMA_WEIGHT_UNLOAD_ERROR:
+            return "error";
+    }
+    return "error";
+}
+
+static void server_error_with_status(
+        server_res_generator & res,
+        const std::string & message,
+        enum error_type type,
+        int status) {
+    json error = format_error_response(message, type);
+    error["code"] = status;
+    res.error(error);
+}
+
+static json server_model_weight_names(const llama_model * model) {
+    const int32_t n_weights = llama_model_weight_count(model);
+    json weights = json::array();
+
+    for (int32_t i = 0; i < n_weights; ++i) {
+        const int32_t len = llama_model_weight_name(model, i, nullptr, 0);
+        if (len <= 0) {
+            continue;
+        }
+
+        std::vector<char> buf((size_t) len + 1);
+        if (llama_model_weight_name(model, i, buf.data(), buf.size()) > 0) {
+            weights.push_back(std::string(buf.data()));
+        }
+    }
+
+    return json {
+        {"count",   n_weights},
+        {"weights", std::move(weights)},
+    };
+}
+
+static std::string server_get_unload_weight_name(const server_http_req & req) {
+    std::string name = string_strip(req.get_param("name"));
+    if (!name.empty() || req.body.empty()) {
+        return name;
+    }
+
+    try {
+        const json body = json::parse(req.body);
+        if (body.is_object() && body.contains("name") && body.at("name").is_string()) {
+            return string_strip(body.at("name").get<std::string>());
+        }
+        if (body.is_string()) {
+            return string_strip(body.get<std::string>());
+        }
+        return "";
+    } catch (const std::exception &) {
+        return string_strip(req.body);
+    }
+}
+
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
         : params(params),
           ctx_server(*ctx_server.impl),
@@ -4070,6 +4144,94 @@ void server_routes::init_routes() {
         res->content_type = "text/plain; version=0.0.4";
         res->status = 200;
         res->data = prometheus.str();
+        return res;
+    };
+
+    this->get_list_weights = [this](const server_http_req &) {
+        auto res = create_response();
+        if (ctx_server.model_tgt == nullptr) {
+            res->error(format_error_response("model is not loaded", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        res->ok(server_model_weight_names(ctx_server.model_tgt));
+        return res;
+    };
+
+    this->post_unload_weight = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (ctx_server.model_tgt == nullptr) {
+            res->error(format_error_response("model is not loaded", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        const std::string name = server_get_unload_weight_name(req);
+        if (name.empty()) {
+            res->error(format_error_response("missing weight name", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        {
+            server_task task(SERVER_TASK_TYPE_METRICS);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true);
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+        GGML_ASSERT(res_task != nullptr);
+
+        if (res_task->n_processing_slots > 0 || res_task->n_tasks_deferred > 0) {
+            server_error_with_status(
+                    *res,
+                    "server is busy, retry when no slot/request is processing",
+                    ERROR_TYPE_UNAVAILABLE,
+                    409);
+            return res;
+        }
+
+        const enum llama_weight_unload_result unload_result =
+            llama_model_unload_weight(ctx_server.model_tgt, name.c_str());
+        const char * status = server_weight_unload_result_str(unload_result);
+
+        switch (unload_result) {
+            case LLAMA_WEIGHT_UNLOAD_SUCCESS:
+            case LLAMA_WEIGHT_UNLOAD_NOT_RESIDENT:
+                res->ok({
+                    {"ok",     true},
+                    {"name",   name},
+                    {"status", status},
+                });
+                return res;
+            case LLAMA_WEIGHT_UNLOAD_NOT_FOUND:
+                res->error(format_error_response("weight not found: " + name, ERROR_TYPE_NOT_FOUND));
+                return res;
+            case LLAMA_WEIGHT_UNLOAD_NOT_MANAGED:
+                res->error(format_error_response("weight is not managed by Vulkan: " + name, ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            case LLAMA_WEIGHT_UNLOAD_BUSY:
+                server_error_with_status(
+                        *res,
+                        "weight is busy, retry when no slot/request is processing: " + name,
+                        ERROR_TYPE_UNAVAILABLE,
+                        409);
+                return res;
+            case LLAMA_WEIGHT_UNLOAD_ERROR:
+                res->error(format_error_response("failed to unload weight: " + name, ERROR_TYPE_SERVER));
+                return res;
+        }
+
+        res->error(format_error_response("failed to unload weight: " + name, ERROR_TYPE_SERVER));
         return res;
     };
 

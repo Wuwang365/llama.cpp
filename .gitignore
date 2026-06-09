@@ -44,8 +44,21 @@
 /tags
 /.build/
 /build*
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/compile_commands.json
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/Testing/
+/build.ninja
+/.ninja_deps
+/.ninja_log
+/install_manifest.txt
 /release
 /debug
+/bin/
+/lib/
 /libllama.so
 /llama-*
 /vulkan-shaders-gen
@@ -54,6 +67,18 @@
 /tmp/
 /autogen-*.md
 /common/build-info.cpp
+
+# Local packaging / install outputs
+
+/pkg-android-vulkan/
+
+# Local experiment notes / results
+
+/.codex
+/PLAN.md
+/android-results/
+/docs/superpowers/
+/keepalive_strategy_summary.csv
 
 # Deprecated
 

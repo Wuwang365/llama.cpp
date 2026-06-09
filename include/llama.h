@@ -638,6 +638,26 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    enum llama_weight_unload_result {
+        LLAMA_WEIGHT_UNLOAD_SUCCESS = 0,
+        LLAMA_WEIGHT_UNLOAD_NOT_FOUND,
+        LLAMA_WEIGHT_UNLOAD_NOT_MANAGED,
+        LLAMA_WEIGHT_UNLOAD_NOT_RESIDENT,
+        LLAMA_WEIGHT_UNLOAD_BUSY,
+        LLAMA_WEIGHT_UNLOAD_ERROR,
+    };
+
+    // Returns the number of named model weight tensors.
+    LLAMA_API int32_t llama_model_weight_count(const struct llama_model * model);
+
+    // Writes the weight tensor name at index to buf.
+    // Returns the full name length on success, or -1 if index is invalid.
+    LLAMA_API int32_t llama_model_weight_name(const struct llama_model * model, int32_t index, char * buf, size_t buf_size);
+
+    // Releases backend resident memory for a named weight when supported.
+    // This does not remove model metadata or mmap backing; future graph use can reload the weight.
+    LLAMA_API enum llama_weight_unload_result llama_model_unload_weight(struct llama_model * model, const char * name);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
