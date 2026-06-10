@@ -310,7 +310,7 @@ static ggml_backend_buffer_type_i ggml_backend_vk_managed_buffer_type_interface 
 class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static void ggml_vk_synchronize(ggml_backend_vk_context * ctx, const char * reason = nullptr);
 static void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_t size);
 static bool ggml_vk_tensor_is_managed(const ggml_tensor * tensor);
 static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx);
@@ -1066,6 +1066,7 @@ struct ggml_vk_managed_weight_entry {
     bool preparing = false;
     bool uploading = false;
     bool in_use = false;
+    uint32_t in_use_count = 0;
     bool permanent = false;
     bool backing_released = false;
     uint64_t last_use = 0;
@@ -1098,6 +1099,11 @@ struct ggml_backend_vk_managed_buffer_context {
             ggml_vk_destroy_buffer(item.second.dev_buffer);
         }
     }
+};
+
+struct ggml_vk_managed_retire_batch {
+    vk::Fence fence;
+    std::vector<std::pair<ggml_backend_vk_managed_buffer_context *, uint64_t>> entries;
 };
 
 struct vk_semaphore {
@@ -2122,6 +2128,13 @@ struct ggml_backend_vk_context {
     bool managed_graph_active {};
     bool managed_per_op_acquire {};
     bool managed_sync_after_submit {};
+    bool managed_streaming_submit {};
+    bool managed_streaming_adaptive {};
+    size_t managed_streaming_barrier_limit = 0;
+    size_t managed_streaming_boundary_total = 0;
+    size_t managed_streaming_boundary_seen = 0;
+    size_t managed_streaming_barriers_done = 0;
+    size_t managed_streaming_prefetch_ahead = 1;
     bool managed_prefetch_active {};
     vk_semaphore managed_upload_semaphore;
     uint64_t managed_upload_semaphore_last_submitted {};
@@ -2140,6 +2153,8 @@ struct ggml_backend_vk_context {
     uint64_t managed_staging_allocs = 0;
     uint64_t managed_staging_reuses = 0;
     std::vector<std::pair<ggml_backend_vk_managed_buffer_context *, uint64_t>> managed_acquired;
+    std::vector<std::pair<ggml_backend_vk_managed_buffer_context *, uint64_t>> managed_submit_prepares;
+    std::vector<ggml_vk_managed_retire_batch> managed_pending_retire;
     std::vector<ggml_backend_vk_managed_buffer_context *> managed_graph_contexts;
     std::vector<int> managed_node_layers;
     std::map<int, std::vector<std::pair<ggml_backend_vk_managed_buffer_context *, uint64_t>>> managed_prefetch_layers;
@@ -7311,6 +7326,44 @@ static bool ggml_vk_managed_prefetch_thread_enabled() {
     return env == nullptr || strcmp(env, "0") != 0;
 }
 
+static bool ggml_vk_managed_streaming_submit_enabled() {
+    const char * env = getenv("GGML_VK_MANAGED_STREAMING_SUBMIT");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
+static bool ggml_vk_managed_streaming_adaptive_enabled() {
+    const char * env = getenv("GGML_VK_MANAGED_STREAMING_ADAPTIVE");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
+static size_t ggml_vk_managed_streaming_prefetch_ahead() {
+    const char * env = getenv("GGML_VK_MANAGED_STREAMING_PREFETCH_AHEAD");
+    if (env == nullptr || env[0] == '\0') {
+        return 1;
+    }
+    char * end = nullptr;
+    const unsigned long value = std::strtoul(env, &end, 10);
+    if (end == env) {
+        GGML_LOG_WARN("ggml_vulkan: invalid GGML_VK_MANAGED_STREAMING_PREFETCH_AHEAD='%s', using 1\n", env);
+        return 1;
+    }
+    return (size_t) value;
+}
+
+static size_t ggml_vk_managed_streaming_barrier_limit() {
+    const char * env = getenv("GGML_VK_MANAGED_STREAMING_BARRIERS");
+    if (env == nullptr || env[0] == '\0') {
+        return 0;
+    }
+    char * end = nullptr;
+    const unsigned long value = std::strtoul(env, &end, 10);
+    if (end == env) {
+        GGML_LOG_WARN("ggml_vulkan: invalid GGML_VK_MANAGED_STREAMING_BARRIERS='%s', using all boundaries\n", env);
+        return 0;
+    }
+    return (size_t) value;
+}
+
 static bool ggml_vk_managed_can_prefetch(const ggml_backend_vk_context * ctx) {
     return (bool) ctx->managed_upload_semaphore.s;
 }
@@ -7443,13 +7496,29 @@ static void ggml_vk_managed_finalize_graph_uploads(ggml_backend_vk_context * ctx
     }
 }
 
-static void ggml_vk_managed_add_compute_wait(ggml_backend_vk_context * ctx, uint64_t upload_value) {
+static std::vector<vk_semaphore> * ggml_vk_context_wait_semaphores(vk_context & compute_ctx) {
+    if (compute_ctx == nullptr) {
+        return nullptr;
+    }
+    if (compute_ctx->s != nullptr) {
+        return &compute_ctx->s->wait_semaphores;
+    }
+    if (!compute_ctx->seqs.empty() && !compute_ctx->seqs.back().empty()) {
+        return &compute_ctx->seqs.back().back().wait_semaphores;
+    }
+    return nullptr;
+}
+
+static void ggml_vk_managed_add_context_wait(ggml_backend_vk_context * ctx, vk_context & compute_ctx, uint64_t upload_value) {
     if (!ggml_vk_managed_can_prefetch(ctx) || upload_value == 0) {
         return;
     }
-    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    auto * waits = ggml_vk_context_wait_semaphores(compute_ctx);
+    if (waits == nullptr) {
+        return;
+    }
     bool found = false;
-    for (auto & wait : compute_ctx->s->wait_semaphores) {
+    for (auto & wait : *waits) {
         if (wait.s == ctx->managed_upload_semaphore.s) {
             wait.value = std::max(wait.value, upload_value);
             found = true;
@@ -7457,9 +7526,14 @@ static void ggml_vk_managed_add_compute_wait(ggml_backend_vk_context * ctx, uint
         }
     }
     if (!found) {
-        compute_ctx->s->wait_semaphores.push_back({ ctx->managed_upload_semaphore.s, upload_value });
+        waits->push_back({ ctx->managed_upload_semaphore.s, upload_value });
     }
     ctx->managed_upload_semaphore_last_submitted = std::max(ctx->managed_upload_semaphore_last_submitted, upload_value);
+}
+
+static void ggml_vk_managed_add_compute_wait(ggml_backend_vk_context * ctx, uint64_t upload_value) {
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_managed_add_context_wait(ctx, compute_ctx, upload_value);
 }
 
 static void ggml_vk_managed_evict_entry(ggml_backend_vk_managed_buffer_context * mctx, ggml_vk_managed_weight_entry & entry) {
@@ -7633,29 +7707,190 @@ static ggml_vk_managed_weight_entry & ggml_vk_managed_get_entry(
     return it->second;
 }
 
-static void ggml_vk_managed_record_acquire(
+static bool ggml_vk_managed_record_acquire(
         ggml_backend_vk_context * ctx, ggml_backend_vk_managed_buffer_context * mctx, uint64_t key) {
     if (!ctx) {
-        return;
+        return false;
     }
     for (const auto & item : ctx->managed_acquired) {
         if (item.first == mctx && item.second == key) {
-            return;
+            return false;
         }
     }
     ctx->managed_acquired.emplace_back(mctx, key);
+    return true;
 }
 
-static void ggml_vk_managed_release_acquired(ggml_backend_vk_context * ctx) {
-    std::lock_guard<std::mutex> lock(ctx->managed_mutex);
-    for (const auto & item : ctx->managed_acquired) {
+static bool ggml_vk_managed_record_submit_prepare(
+        ggml_backend_vk_context * ctx, ggml_backend_vk_managed_buffer_context * mctx, uint64_t key) {
+    if (!ctx) {
+        return false;
+    }
+    for (const auto & item : ctx->managed_submit_prepares) {
+        if (item.first == mctx && item.second == key) {
+            return false;
+        }
+    }
+    ctx->managed_submit_prepares.emplace_back(mctx, key);
+    return true;
+}
+
+static void ggml_vk_managed_resolve_submit_prepares(ggml_backend_vk_context * ctx, vk_context & submit_ctx) {
+    if (!ctx || submit_ctx == nullptr) {
+        return;
+    }
+
+    std::vector<std::pair<ggml_backend_vk_managed_buffer_context *, uint64_t>> entries;
+    {
+        std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+        if (ctx->managed_submit_prepares.empty()) {
+            return;
+        }
+        entries = std::move(ctx->managed_submit_prepares);
+        ctx->managed_submit_prepares.clear();
+    }
+
+    uint64_t compute_wait_value = 0;
+    size_t waited_entries = 0;
+    double wait_ms_total = 0.0;
+
+    for (const auto & item : entries) {
+        auto * mctx = item.first;
+        std::unique_lock<std::mutex> lock(ctx->managed_mutex);
+        auto entry_it = mctx->entries.find(item.second);
+        if (entry_it == mctx->entries.end()) {
+            continue;
+        }
+        auto & entry = entry_it->second;
+        if (entry.preparing) {
+            waited_entries++;
+            const auto start = std::chrono::steady_clock::now();
+            ctx->managed_upload_cv.wait(lock, [&entry]() { return !entry.preparing; });
+            const auto end = std::chrono::steady_clock::now();
+            const double wait_ms = (double) std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1000000.0;
+            wait_ms_total += wait_ms;
+            if (getenv("GGML_VK_MANAGED_DEBUG")) {
+                fprintf(stderr, "ggml_vulkan: managed wait_preparing_submit_done name=%s wait_ms=%.3f\n",
+                    entry.tensor ? ggml_get_name(entry.tensor) : "<unknown>", wait_ms);
+            }
+        }
+        if (entry.uploading) {
+            if (ggml_vk_managed_upload_complete(ctx, entry)) {
+                ggml_vk_managed_finish_upload(ctx, mctx, entry);
+            } else {
+                compute_wait_value = std::max(compute_wait_value, entry.upload_value);
+            }
+        }
+    }
+
+    if (compute_wait_value != 0) {
+        ggml_vk_managed_add_context_wait(ctx, submit_ctx, compute_wait_value);
+    }
+
+    if (getenv("GGML_VK_MANAGED_DEBUG") && (!entries.empty() || compute_wait_value != 0)) {
+        fprintf(stderr,
+            "ggml_vulkan: managed submit_prepare_resolved entries=%zu waited=%zu wait_ms=%.3f upload_wait_value=%llu\n",
+            entries.size(),
+            waited_entries,
+            wait_ms_total,
+            (unsigned long long) compute_wait_value);
+    }
+}
+
+static size_t ggml_vk_managed_release_entries_locked(
+        const std::vector<std::pair<ggml_backend_vk_managed_buffer_context *, uint64_t>> & entries) {
+    size_t released = 0;
+    for (const auto & item : entries) {
         auto * mctx = item.first;
         auto it = mctx->entries.find(item.second);
         if (it != mctx->entries.end()) {
-            it->second.in_use = false;
+            auto & entry = it->second;
+            if (entry.in_use_count > 0) {
+                entry.in_use_count--;
+            }
+            entry.in_use = entry.in_use_count != 0;
+            released++;
         }
     }
+    return released;
+}
+
+static size_t ggml_vk_managed_release_acquired(ggml_backend_vk_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+    const size_t released = ggml_vk_managed_release_entries_locked(ctx->managed_acquired);
     ctx->managed_acquired.clear();
+    return released;
+}
+
+static size_t ggml_vk_managed_retire_poll(ggml_backend_vk_context * ctx) {
+    size_t released = 0;
+    std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+    auto & pending = ctx->managed_pending_retire;
+    for (auto it = pending.begin(); it != pending.end();) {
+        const vk::Result status = ctx->device->device.getFenceStatus(it->fence);
+        if (status == vk::Result::eNotReady) {
+            ++it;
+            continue;
+        }
+        if (status != vk::Result::eSuccess) {
+            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(status).c_str(), __FILE__, __LINE__);
+            exit(1);
+        }
+
+        released += ggml_vk_managed_release_entries_locked(it->entries);
+        ctx->device->device.destroyFence(it->fence);
+        it = pending.erase(it);
+    }
+    return released;
+}
+
+static size_t ggml_vk_managed_retire_wait_all(ggml_backend_vk_context * ctx) {
+    size_t released = 0;
+    while (true) {
+        vk::Fence fence = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+            if (ctx->managed_pending_retire.empty()) {
+                break;
+            }
+            fence = ctx->managed_pending_retire.front().fence;
+        }
+        VK_CHECK(ctx->device->device.waitForFences({ fence }, true, UINT64_MAX), "managed retire waitForFences");
+        released += ggml_vk_managed_retire_poll(ctx);
+    }
+    return released;
+}
+
+static bool ggml_vk_managed_retire_enqueue_current_acquired(
+        ggml_backend_vk_context * ctx,
+        size_t * n_entries = nullptr) {
+    std::vector<std::pair<ggml_backend_vk_managed_buffer_context *, uint64_t>> entries;
+    {
+        std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+        if (ctx->managed_acquired.empty()) {
+            if (n_entries) {
+                *n_entries = 0;
+            }
+            return false;
+        }
+        entries = std::move(ctx->managed_acquired);
+        ctx->managed_acquired.clear();
+    }
+
+    vk::Fence fence = ctx->device->device.createFence({});
+    {
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->device->compute_queue.queue.submit({}, fence);
+    }
+
+    if (n_entries) {
+        *n_entries = entries.size();
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+        ctx->managed_pending_retire.push_back({ fence, std::move(entries) });
+    }
+    return true;
 }
 
 static void ggml_vk_managed_buffer_write(vk_buffer & dst, size_t offset, const uint8_t * src, size_t size) {
@@ -7803,12 +8038,27 @@ static vk_tensor_ref ggml_vk_managed_acquire_tensor(
     }
 
     entry.last_use = ++mctx->use_clock;
-    if (entry.preparing) {
+    if (entry.preparing && entry.resident && entry.dev_buffer != nullptr) {
         mctx->stats_prefetch_late++;
+        ggml_vk_managed_record_submit_prepare(ctx, mctx, key);
+        if (getenv("GGML_VK_MANAGED_DEBUG")) {
+            fprintf(stderr, "ggml_vulkan: managed defer_preparing name=%s\n", ggml_get_name(tensor));
+        }
+    } else if (entry.preparing) {
+        mctx->stats_prefetch_late++;
+        const auto start = std::chrono::steady_clock::now();
         ctx->managed_upload_cv.wait(lock, [&entry]() { return !entry.preparing; });
+        if (getenv("GGML_VK_MANAGED_DEBUG")) {
+            const auto end = std::chrono::steady_clock::now();
+            const double wait_ms = (double) std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1000000.0;
+            fprintf(stderr, "ggml_vulkan: managed wait_preparing_done name=%s wait_ms=%.3f\n",
+                ggml_get_name(tensor), wait_ms);
+        }
     }
     if (entry.resident) {
-        if (entry.uploading) {
+        if (entry.preparing) {
+            // Submit resolution will wait for preparation to publish the upload semaphore value.
+        } else if (entry.uploading) {
             if (ggml_vk_managed_upload_complete(ctx, entry)) {
                 ggml_vk_managed_finish_upload(ctx, mctx, entry);
                 mctx->stats_cache_hits++;
@@ -7843,15 +8093,23 @@ static vk_tensor_ref ggml_vk_managed_acquire_tensor(
         mctx->stats_upload_bytes += nbytes;
         mctx->stats_sync_upload_bytes += nbytes;
         mctx->stats_upload_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        if (getenv("GGML_VK_MANAGED_DEBUG")) {
+            const double upload_ms = (double) std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() / 1000000.0;
+            fprintf(stderr, "ggml_vulkan: managed sync_fallback_done name=%s nbytes=%zu upload_ms=%.3f\n",
+                ggml_get_name(tensor), nbytes, upload_ms);
+        }
         ggml_vk_managed_madvise_entry(mctx, entry);
         ctx->managed_upload_cv.notify_all();
     }
 
     if (lease) {
-        entry.in_use = true;
-        ggml_vk_managed_record_acquire(ctx, mctx, key);
+        if (ggml_vk_managed_record_acquire(ctx, mctx, key)) {
+            entry.in_use_count++;
+            entry.in_use = true;
+        }
     }
 
+    GGML_ASSERT(entry.dev_buffer != nullptr);
     result = vk_tensor_ref{vk_subbuffer{entry.dev_buffer, 0, entry.nbytes}, key, 0};
     }
 
@@ -7905,6 +8163,7 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
 }
 
 static void ggml_vk_managed_prepare_graph(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ggml_vk_managed_retire_wait_all(ctx);
     if (!ctx->managed_acquired.empty()) {
         ggml_vk_synchronize(ctx);
         ggml_vk_managed_release_acquired(ctx);
@@ -7913,6 +8172,13 @@ static void ggml_vk_managed_prepare_graph(ggml_backend_vk_context * ctx, const g
     ctx->managed_graph_active = false;
     ctx->managed_per_op_acquire = false;
     ctx->managed_sync_after_submit = false;
+    ctx->managed_streaming_submit = false;
+    ctx->managed_streaming_adaptive = false;
+    ctx->managed_streaming_barrier_limit = 0;
+    ctx->managed_streaming_boundary_total = 0;
+    ctx->managed_streaming_boundary_seen = 0;
+    ctx->managed_streaming_barriers_done = 0;
+    ctx->managed_streaming_prefetch_ahead = 1;
     ctx->managed_prefetch_active = false;
     ctx->managed_upload_semaphore_last_submitted = 0;
     ctx->managed_prefetch_inflight_limit = 0;
@@ -7922,6 +8188,7 @@ static void ggml_vk_managed_prepare_graph(ggml_backend_vk_context * ctx, const g
     ctx->managed_upload_thread_running = false;
     ctx->managed_upload_thread_enabled = false;
     ctx->managed_upload_thread_used = false;
+    ctx->managed_submit_prepares.clear();
     ctx->managed_graph_contexts.clear();
     ctx->managed_node_layers.assign(cgraph->n_nodes, -1);
     ctx->managed_prefetch_layers.clear();
@@ -7982,11 +8249,20 @@ static void ggml_vk_managed_prepare_graph(ggml_backend_vk_context * ctx, const g
         }
     }
     if (ctx->managed_per_op_acquire) {
+        ctx->managed_streaming_submit = ggml_vk_managed_streaming_submit_enabled();
+        ctx->managed_streaming_adaptive =
+            ctx->managed_streaming_submit && ggml_vk_managed_streaming_adaptive_enabled();
+        ctx->managed_streaming_prefetch_ahead = ggml_vk_managed_streaming_prefetch_ahead();
         ctx->managed_prefetch_active = ggml_vk_managed_can_prefetch(ctx) && !ctx->managed_prefetch_layers.empty();
         if (ctx->managed_prefetch_active) {
             ctx->managed_prefetch_inflight_limit = ggml_vk_managed_prefetch_inflight_limit();
             ctx->managed_prefetch_batch_limit = ggml_vk_managed_prefetch_batch_limit();
             ctx->managed_prefetch_next_layer = ctx->managed_prefetch_layers.begin()->first;
+            if (ctx->managed_streaming_submit) {
+                ctx->managed_streaming_barrier_limit = ggml_vk_managed_streaming_barrier_limit();
+                ctx->managed_streaming_boundary_total =
+                    ctx->managed_prefetch_layers.size() > 1 ? ctx->managed_prefetch_layers.size() - 1 : 0;
+            }
         }
         return;
     }
@@ -8127,6 +8403,61 @@ static size_t ggml_vk_managed_upload_staging_bytes(ggml_backend_vk_context * ctx
 static int ggml_vk_managed_layer_after(const ggml_backend_vk_context * ctx, int layer) {
     auto it = ctx->managed_prefetch_layers.upper_bound(layer);
     return it == ctx->managed_prefetch_layers.end() ? -1 : it->first;
+}
+
+static bool ggml_vk_managed_layer_prefetched_locked(ggml_backend_vk_context * ctx, int layer) {
+    auto it = ctx->managed_prefetch_layers.find(layer);
+    if (it == ctx->managed_prefetch_layers.end()) {
+        return true;
+    }
+    for (const auto & item : it->second) {
+        auto entry_it = item.first->entries.find(item.second);
+        if (entry_it == item.first->entries.end()) {
+            continue;
+        }
+        const auto & entry = entry_it->second;
+        if (!entry.resident || entry.preparing) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_vk_managed_prefetch_ahead_ready_locked(
+        ggml_backend_vk_context * ctx,
+        int first_layer,
+        size_t ahead) {
+    int layer = first_layer;
+    for (size_t i = 0; i < ahead && layer >= 0; ++i) {
+        if (!ggml_vk_managed_layer_prefetched_locked(ctx, layer)) {
+            return false;
+        }
+        layer = ggml_vk_managed_layer_after(ctx, layer);
+    }
+    return true;
+}
+
+static double ggml_vk_managed_wait_prefetch_ahead(
+        ggml_backend_vk_context * ctx,
+        int first_layer,
+        size_t ahead) {
+    if (!ctx->managed_prefetch_active || first_layer < 0 || ahead == 0) {
+        return 0.0;
+    }
+
+    const int64_t start_us = ggml_time_us();
+    while (true) {
+        ggml_vk_managed_finalize_graph_uploads(ctx, false);
+        {
+            std::unique_lock<std::mutex> lock(ctx->managed_mutex);
+            if (!ctx->managed_prefetch_active ||
+                ggml_vk_managed_prefetch_ahead_ready_locked(ctx, first_layer, ahead)) {
+                break;
+            }
+            ctx->managed_upload_cv.wait_for(lock, std::chrono::microseconds(100));
+        }
+    }
+    return (double) (ggml_time_us() - start_us) / 1000.0;
 }
 
 static void ggml_vk_managed_prefetch_pump(ggml_backend_vk_context * ctx) {
@@ -8530,6 +8861,31 @@ static int ggml_vk_managed_next_layer(const ggml_backend_vk_context * ctx, int n
     return -1;
 }
 
+static bool ggml_vk_managed_streaming_should_barrier(ggml_backend_vk_context * ctx) {
+    if (!ctx->managed_streaming_submit) {
+        return false;
+    }
+
+    ctx->managed_streaming_boundary_seen++;
+
+    const size_t limit = ctx->managed_streaming_barrier_limit;
+    const size_t total = ctx->managed_streaming_boundary_total;
+    if (limit == 0 || total == 0 || total <= limit) {
+        ctx->managed_streaming_barriers_done++;
+        return true;
+    }
+    if (ctx->managed_streaming_barriers_done >= limit) {
+        return false;
+    }
+
+    const size_t next_barrier = ctx->managed_streaming_barriers_done + 1;
+    const bool selected = next_barrier * total <= ctx->managed_streaming_boundary_seen * limit;
+    if (selected) {
+        ctx->managed_streaming_barriers_done++;
+    }
+    return selected;
+}
+
 static void ggml_vk_managed_print_stats(ggml_backend_vk_context * ctx) {
     if (!ggml_vk_managed_stats_enabled()) {
         return;
@@ -8546,7 +8902,8 @@ static void ggml_vk_managed_print_stats(ggml_backend_vk_context * ctx) {
             " sync_fallback=%" PRIu64 " evictions=%" PRIu64
             " upload=%.2f MiB async=%.2f MiB sync=%.2f MiB upload_time=%.3f ms madvise=%.2f MiB resident=%.2f MiB"
             " staging_slots=%zu staging_pool=%.2f MiB staging_allocs=%" PRIu64 " staging_reuses=%" PRIu64
-            " prefetch_thread=%d\n",
+            " prefetch_thread=%d streaming_submit=%d streaming_adaptive=%d streaming_barriers=%zu/%zu"
+            " streaming_boundaries=%zu/%zu pending_retire=%zu\n",
             mctx->name.c_str(),
             mctx->stats_cache_hits,
             mctx->stats_cache_misses,
@@ -8565,7 +8922,14 @@ static void ggml_vk_managed_print_stats(ggml_backend_vk_context * ctx) {
             (double) ctx->managed_staging_pool_bytes / (1024.0 * 1024.0),
             ctx->managed_staging_allocs,
             ctx->managed_staging_reuses,
-            ctx->managed_upload_thread_used ? 1 : 0);
+            ctx->managed_upload_thread_used ? 1 : 0,
+            ctx->managed_streaming_submit ? 1 : 0,
+            ctx->managed_streaming_adaptive ? 1 : 0,
+            ctx->managed_streaming_barriers_done,
+            ctx->managed_streaming_barrier_limit,
+            ctx->managed_streaming_boundary_seen,
+            ctx->managed_streaming_boundary_total,
+            ctx->managed_pending_retire.size());
     }
 }
 
@@ -15060,6 +15424,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     if (subctx) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
+        ggml_vk_managed_resolve_submit_prepares(ctx, subctx);
         ggml_vk_submit(subctx, {});
         ctx->submit_pending = true;
         ggml_vk_synchronize(ctx);
@@ -15640,6 +16005,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
+        ggml_vk_managed_resolve_submit_prepares(ctx, subctx);
         if (almost_ready && !ctx->almost_ready_fence_pending) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
@@ -15678,10 +16044,19 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
     ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+    ggml_vk_managed_retire_wait_all(ctx);
     ggml_vk_managed_release_acquired(ctx);
+    ctx->managed_submit_prepares.clear();
     ctx->managed_graph_active = false;
     ctx->managed_per_op_acquire = false;
     ctx->managed_sync_after_submit = false;
+    ctx->managed_streaming_submit = false;
+    ctx->managed_streaming_adaptive = false;
+    ctx->managed_streaming_barrier_limit = 0;
+    ctx->managed_streaming_boundary_total = 0;
+    ctx->managed_streaming_boundary_seen = 0;
+    ctx->managed_streaming_barriers_done = 0;
+    ctx->managed_streaming_prefetch_ahead = 1;
     ctx->managed_prefetch_active = false;
     ctx->managed_prefetch_inflight_limit = 0;
     ctx->managed_prefetch_batch_limit = 0;
@@ -16446,12 +16821,29 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+static void ggml_vk_synchronize(ggml_backend_vk_context * ctx, const char * reason) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+
+    const bool timing_enabled = reason != nullptr && getenv("GGML_VK_MANAGED_DEBUG") != nullptr;
+    const int64_t total_start_us = timing_enabled ? ggml_time_us() : 0;
+    int64_t transfer_submit_us = 0;
+    int64_t ctx_end_us = 0;
+    int64_t in_memcpy_us = 0;
+    int64_t compute_submit_us = 0;
+    int64_t queue_submit_us = 0;
+    int64_t fence_wait_us = 0;
+    int64_t out_memcpy_us = 0;
+    bool waited_for_fence = false;
+    bool waits_transfer = false;
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
-    if (ggml_vk_submit_transfer_ctx(ctx)) {
+    int64_t t_start_us = timing_enabled ? ggml_time_us() : 0;
+    const bool transfer_submitted = ggml_vk_submit_transfer_ctx(ctx);
+    if (timing_enabled) {
+        transfer_submit_us = ggml_time_us() - t_start_us;
+    }
+    if (transfer_submitted) {
         ctx->submit_pending = true;
     }
 
@@ -16463,17 +16855,34 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             cmd_buf = compute_ctx->s->buffer;
         }
 
+        t_start_us = timing_enabled ? ggml_time_us() : 0;
         ggml_vk_ctx_end(compute_ctx);
+        if (timing_enabled) {
+            ctx_end_us = ggml_time_us() - t_start_us;
+        }
 
+        t_start_us = timing_enabled ? ggml_time_us() : 0;
         for (auto& cpy : compute_ctx->in_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
+        if (timing_enabled) {
+            in_memcpy_us = ggml_time_us() - t_start_us;
+        }
 
+        t_start_us = timing_enabled ? ggml_time_us() : 0;
+        ggml_vk_managed_resolve_submit_prepares(ctx, compute_ctx);
         ggml_vk_submit(compute_ctx, {});
+        if (timing_enabled) {
+            compute_submit_us = ggml_time_us() - t_start_us;
+        }
         ctx->submit_pending = true;
     }
 
     if (ctx->submit_pending) {
+        waits_transfer =
+            ctx->device->async_use_transfer_queue &&
+            ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value;
+        t_start_us = timing_enabled ? ggml_time_us() : 0;
         if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
             vk::TimelineSemaphoreSubmitInfo tl_info{
                 1, &ctx->transfer_semaphore.value,
@@ -16493,7 +16902,15 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             std::lock_guard<std::mutex> guard(queue_mutex);
             ctx->device->compute_queue.queue.submit({}, ctx->fence);
         }
+        if (timing_enabled) {
+            queue_submit_us = ggml_time_us() - t_start_us;
+        }
+        t_start_us = timing_enabled ? ggml_time_us() : 0;
         ggml_vk_wait_for_fence(ctx);
+        if (timing_enabled) {
+            fence_wait_us = ggml_time_us() - t_start_us;
+        }
+        waited_for_fence = true;
         ctx->submit_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
@@ -16502,10 +16919,35 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 
     if (do_transfer) {
+        t_start_us = timing_enabled ? ggml_time_us() : 0;
         for (auto& cpy : compute_ctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
+        if (timing_enabled) {
+            out_memcpy_us = ggml_time_us() - t_start_us;
+        }
         ctx->compute_ctx.reset();
+    }
+
+    if (timing_enabled) {
+        const double total_ms = (double) (ggml_time_us() - total_start_us) / 1000.0;
+        fprintf(stderr,
+            "ggml_vulkan: managed sync_detail reason=%s do_compute_ctx=%d transfer_submitted=%d waited_for_fence=%d waits_transfer=%d "
+            "transfer_submit_ms=%.3f ctx_end_ms=%.3f in_memcpy_ms=%.3f compute_submit_ms=%.3f "
+            "queue_submit_ms=%.3f fence_wait_ms=%.3f out_memcpy_ms=%.3f total_ms=%.3f\n",
+            reason,
+            do_transfer ? 1 : 0,
+            transfer_submitted ? 1 : 0,
+            waited_for_fence ? 1 : 0,
+            waits_transfer ? 1 : 0,
+            (double) transfer_submit_us / 1000.0,
+            (double) ctx_end_us / 1000.0,
+            (double) in_memcpy_us / 1000.0,
+            (double) compute_submit_us / 1000.0,
+            (double) queue_submit_us / 1000.0,
+            (double) fence_wait_us / 1000.0,
+            (double) out_memcpy_us / 1000.0,
+            total_ms);
     }
 }
 
@@ -17365,12 +17807,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         const int fused_end_idx = i + ctx->num_additional_fused_ops;
         const int next_managed_layer = ggml_vk_managed_next_layer(ctx, fused_end_idx + 1);
-        const bool managed_layer_boundary_submit =
-            !managed_use_prefetch_worker &&
+        const bool managed_layer_boundary =
             ctx->managed_prefetch_active &&
             current_managed_layer >= 0 &&
             next_managed_layer >= 0 &&
             next_managed_layer != current_managed_layer;
+        const bool managed_streaming_boundary_submit =
+            managed_layer_boundary && ggml_vk_managed_streaming_should_barrier(ctx);
+        const bool managed_layer_boundary_submit =
+            (!managed_use_prefetch_worker && managed_layer_boundary) ||
+            managed_streaming_boundary_submit;
         bool submit = ctx->managed_sync_after_submit ||
                       managed_layer_boundary_submit ||
                       (submitted_nodes >= nodes_per_submit) ||
@@ -17414,9 +17860,79 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
             submit_count++;
 
-            if (ctx->managed_sync_after_submit) {
-                ggml_vk_synchronize(ctx);
-                ggml_vk_managed_release_acquired(ctx);
+            const bool managed_streaming_boundary_wait =
+                managed_streaming_boundary_submit && !ctx->managed_streaming_adaptive;
+            const bool managed_streaming_boundary_adaptive =
+                managed_streaming_boundary_submit && ctx->managed_streaming_adaptive;
+            if (ctx->managed_sync_after_submit || managed_streaming_boundary_wait) {
+                if (managed_streaming_boundary_wait && getenv("GGML_VK_MANAGED_DEBUG")) {
+                    fprintf(stderr,
+                        "ggml_vulkan: managed streaming_boundary_done layer=%d next_layer=%d node=%d barrier=%zu/%zu boundary=%zu/%zu\n",
+                        current_managed_layer, next_managed_layer, i,
+                        ctx->managed_streaming_barriers_done,
+                        ctx->managed_streaming_barrier_limit,
+                        ctx->managed_streaming_boundary_seen,
+                        ctx->managed_streaming_boundary_total);
+                }
+                const int64_t sync_start_us = managed_streaming_boundary_wait ? ggml_time_us() : 0;
+                ggml_vk_synchronize(ctx, managed_streaming_boundary_wait ? "streaming_boundary" : nullptr);
+                const int64_t sync_us = managed_streaming_boundary_wait ? ggml_time_us() - sync_start_us : 0;
+                const int64_t release_start_us = managed_streaming_boundary_wait ? ggml_time_us() : 0;
+                const size_t released = ggml_vk_managed_release_acquired(ctx);
+                const int64_t release_us = managed_streaming_boundary_wait ? ggml_time_us() - release_start_us : 0;
+                if (managed_streaming_boundary_wait && getenv("GGML_VK_MANAGED_DEBUG")) {
+                    fprintf(stderr,
+                        "ggml_vulkan: managed streaming_boundary_sync_done layer=%d next_layer=%d node=%d barrier=%zu/%zu boundary=%zu/%zu "
+                        "sync_ms=%.3f release_ms=%.3f released=%zu total_ms=%.3f\n",
+                        current_managed_layer, next_managed_layer, i,
+                        ctx->managed_streaming_barriers_done,
+                        ctx->managed_streaming_barrier_limit,
+                        ctx->managed_streaming_boundary_seen,
+                        ctx->managed_streaming_boundary_total,
+                        (double) sync_us / 1000.0,
+                        (double) release_us / 1000.0,
+                        released,
+                        (double) (sync_us + release_us) / 1000.0);
+                }
+            }
+            if (managed_streaming_boundary_adaptive) {
+                if (getenv("GGML_VK_MANAGED_DEBUG")) {
+                    fprintf(stderr,
+                        "ggml_vulkan: managed streaming_boundary_done layer=%d next_layer=%d node=%d barrier=%zu/%zu boundary=%zu/%zu adaptive=1\n",
+                        current_managed_layer, next_managed_layer, i,
+                        ctx->managed_streaming_barriers_done,
+                        ctx->managed_streaming_barrier_limit,
+                        ctx->managed_streaming_boundary_seen,
+                        ctx->managed_streaming_boundary_total);
+                }
+                const size_t retired_before = ggml_vk_managed_retire_poll(ctx);
+                size_t retire_entries = 0;
+                const bool retire_enqueued =
+                    ggml_vk_managed_retire_enqueue_current_acquired(ctx, &retire_entries);
+                const double prefetch_wait_ms = ggml_vk_managed_wait_prefetch_ahead(
+                    ctx, next_managed_layer, ctx->managed_streaming_prefetch_ahead);
+                const size_t retired_after = ggml_vk_managed_retire_poll(ctx);
+                size_t pending_retire = 0;
+                {
+                    std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+                    pending_retire = ctx->managed_pending_retire.size();
+                }
+                if (getenv("GGML_VK_MANAGED_DEBUG")) {
+                    fprintf(stderr,
+                        "ggml_vulkan: managed streaming_boundary_adaptive_done layer=%d next_layer=%d node=%d barrier=%zu/%zu boundary=%zu/%zu "
+                        "retire_enqueued=%d retire_entries=%zu retired=%zu pending_retire=%zu prefetch_ahead=%zu prefetch_wait_ms=%.3f\n",
+                        current_managed_layer, next_managed_layer, i,
+                        ctx->managed_streaming_barriers_done,
+                        ctx->managed_streaming_barrier_limit,
+                        ctx->managed_streaming_boundary_seen,
+                        ctx->managed_streaming_boundary_total,
+                        retire_enqueued ? 1 : 0,
+                        retire_entries,
+                        retired_before + retired_after,
+                        pending_retire,
+                        ctx->managed_streaming_prefetch_ahead,
+                        prefetch_wait_ms);
+                }
             }
             if (!managed_use_prefetch_worker) {
                 ggml_vk_managed_prefetch_pump(ctx);
@@ -17435,6 +17951,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         compute_ctx = ctx->compute_ctx.lock();
         ggml_vk_ctx_end(compute_ctx);
 
+        ggml_vk_managed_resolve_submit_prepares(ctx, compute_ctx);
         ggml_vk_submit(compute_ctx, ctx->device->fence);
         VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "GGML_VULKAN_PERF waitForFences");
         ctx->device->device.resetFences({ ctx->device->fence });
@@ -17478,13 +17995,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (ctx->managed_graph_active) {
         ggml_vk_synchronize(ctx);
+        ggml_vk_managed_retire_wait_all(ctx);
         ggml_vk_managed_stop_prefetch_worker(ctx);
         ggml_vk_managed_finalize_graph_uploads(ctx, true);
         ggml_vk_managed_print_stats(ctx);
         ggml_vk_managed_release_acquired(ctx);
+        ctx->managed_submit_prepares.clear();
         ctx->managed_graph_active = false;
         ctx->managed_per_op_acquire = false;
         ctx->managed_sync_after_submit = false;
+        ctx->managed_streaming_submit = false;
+        ctx->managed_streaming_adaptive = false;
+        ctx->managed_streaming_barrier_limit = 0;
+        ctx->managed_streaming_boundary_total = 0;
+        ctx->managed_streaming_boundary_seen = 0;
+        ctx->managed_streaming_barriers_done = 0;
+        ctx->managed_streaming_prefetch_ahead = 1;
         ctx->managed_prefetch_active = false;
         ctx->managed_prefetch_inflight_limit = 0;
         ctx->managed_prefetch_batch_limit = 0;
@@ -17789,6 +18315,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
     ggml_vk_ctx_end(compute_ctx);
 
+    ggml_vk_managed_resolve_submit_prepares(ctx, compute_ctx);
     ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
     vkev->cmd_buffer = cmd_buf;
