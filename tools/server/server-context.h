@@ -108,6 +108,7 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_list_weights;
     server_http_context::handler_t post_unload_weight;
+    server_http_context::handler_t post_reclaim_weights;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;

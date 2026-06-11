@@ -43,6 +43,22 @@ int main(int argc, char ** argv) {
         llama_model_unload_weight(model, "__missing_weight_for_test__");
     require_true(missing == LLAMA_WEIGHT_UNLOAD_NOT_FOUND, "expected missing weight to return not-found");
 
+    llama_weight_reclaim_params reclaim_params = llama_model_reclaim_default_params();
+    reclaim_params.keep_first_layers = 5;
+    reclaim_params.target_bytes = 1024;
+
+    llama_weight_reclaim_result reclaim_result;
+    memset(&reclaim_result, 0xff, sizeof(reclaim_result));
+
+    const llama_weight_reclaim_status reclaim_status =
+        llama_model_reclaim_weights(model, &reclaim_params, &reclaim_result);
+    require_true(reclaim_status == LLAMA_WEIGHT_RECLAIM_NOT_MANAGED, "expected CPU weights to return not-managed");
+    require_true(reclaim_result.reclaimed_nodes == 0, "expected no reclaimed nodes");
+    require_true(reclaim_result.reclaimed_tensors == 0, "expected no reclaimed tensors");
+    require_true(reclaim_result.reclaimed_bytes == 0, "expected no reclaimed bytes");
+    require_true(reclaim_result.kept_nodes == 0, "expected no kept nodes");
+    require_true(reclaim_result.skipped_busy_nodes == 0, "expected no skipped busy nodes");
+
     llama_model_free(model);
     llama_backend_free();
 

@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -3965,6 +3966,20 @@ static const char * server_weight_unload_result_str(enum llama_weight_unload_res
     return "error";
 }
 
+static const char * server_weight_reclaim_status_str(enum llama_weight_reclaim_status status) {
+    switch (status) {
+        case LLAMA_WEIGHT_RECLAIM_SUCCESS:
+            return "reclaimed";
+        case LLAMA_WEIGHT_RECLAIM_NOT_MANAGED:
+            return "not_managed";
+        case LLAMA_WEIGHT_RECLAIM_BUSY:
+            return "busy";
+        case LLAMA_WEIGHT_RECLAIM_ERROR:
+            return "error";
+    }
+    return "error";
+}
+
 static void server_error_with_status(
         server_res_generator & res,
         const std::string & message,
@@ -4015,6 +4030,116 @@ static std::string server_get_unload_weight_name(const server_http_req & req) {
     } catch (const std::exception &) {
         return string_strip(req.body);
     }
+}
+
+static bool server_json_nonnegative_size(
+        const json & body,
+        const char * key,
+        size_t & value,
+        std::string & error) {
+    const json & field = body.at(key);
+    if (field.is_number_unsigned()) {
+        value = (size_t) field.get<uint64_t>();
+        return true;
+    }
+    if (field.is_number_integer()) {
+        const int64_t signed_value = field.get<int64_t>();
+        if (signed_value >= 0) {
+            value = (size_t) signed_value;
+            return true;
+        }
+    }
+
+    error = std::string(key) + " must be a non-negative integer";
+    return false;
+}
+
+static bool server_get_reclaim_params(
+        const server_http_req & req,
+        struct llama_weight_reclaim_params & params,
+        std::string & error) {
+    params = llama_model_reclaim_default_params();
+    if (req.body.empty()) {
+        return true;
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception & e) {
+        error = std::string("invalid JSON body: ") + e.what();
+        return false;
+    }
+
+    if (!body.is_object()) {
+        error = "request body must be a JSON object";
+        return false;
+    }
+
+    if (body.contains("policy")) {
+        if (!body.at("policy").is_string()) {
+            error = "policy must be a string";
+            return false;
+        }
+        const std::string policy = body.at("policy").get<std::string>();
+        if (policy != "chain") {
+            error = "unsupported reclaim policy: " + policy;
+            return false;
+        }
+    }
+
+    if (body.contains("keep_first_layers")) {
+        if (!body.at("keep_first_layers").is_number_integer()) {
+            error = "keep_first_layers must be an integer";
+            return false;
+        }
+        const int64_t keep_first_layers = body.at("keep_first_layers").get<int64_t>();
+        if (keep_first_layers < std::numeric_limits<int32_t>::min() ||
+                keep_first_layers > std::numeric_limits<int32_t>::max()) {
+            error = "keep_first_layers is out of int32 range";
+            return false;
+        }
+        params.keep_first_layers = (int32_t) keep_first_layers;
+    }
+
+    if (body.contains("target_bytes")) {
+        return server_json_nonnegative_size(body, "target_bytes", params.target_bytes, error);
+    }
+
+    if (!body.contains("target_bytes") && body.contains("target_mb")) {
+        if (!body.at("target_mb").is_number()) {
+            error = "target_mb must be a non-negative number";
+            return false;
+        }
+        const double target_mb = body.at("target_mb").get<double>();
+        if (target_mb < 0.0) {
+            error = "target_mb must be a non-negative number";
+            return false;
+        }
+        params.target_bytes = (size_t) (target_mb * 1024.0 * 1024.0);
+    }
+
+    return true;
+}
+
+static json server_weight_reclaim_result_json(
+        const struct llama_weight_reclaim_params & params,
+        const struct llama_weight_reclaim_result & result,
+        const char * status) {
+    return json {
+        {"ok",                 true},
+        {"status",             status},
+        {"policy",             "chain"},
+        {"keep_first_layers",  params.keep_first_layers},
+        {"target_bytes",       params.target_bytes},
+        {"target_mb",          (double) params.target_bytes / (1024.0 * 1024.0)},
+        {"reclaimed_nodes",    result.reclaimed_nodes},
+        {"reclaimed_tensors",  result.reclaimed_tensors},
+        {"reclaimed_bytes",    result.reclaimed_bytes},
+        {"reclaimed_mib",      (double) result.reclaimed_bytes / (1024.0 * 1024.0)},
+        {"kept_nodes",         result.kept_nodes},
+        {"skipped_busy_nodes", result.skipped_busy_nodes},
+    };
 }
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
@@ -4232,6 +4357,77 @@ void server_routes::init_routes() {
         }
 
         res->error(format_error_response("failed to unload weight: " + name, ERROR_TYPE_SERVER));
+        return res;
+    };
+
+    this->post_reclaim_weights = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (ctx_server.model_tgt == nullptr) {
+            res->error(format_error_response("model is not loaded", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        struct llama_weight_reclaim_params reclaim_params;
+        std::string param_error;
+        if (!server_get_reclaim_params(req, reclaim_params, param_error)) {
+            res->error(format_error_response(param_error, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        {
+            server_task task(SERVER_TASK_TYPE_METRICS);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true);
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+        GGML_ASSERT(res_task != nullptr);
+
+        if (res_task->n_processing_slots > 0 || res_task->n_tasks_deferred > 0) {
+            server_error_with_status(
+                    *res,
+                    "server is busy, retry when no slot/request is processing",
+                    ERROR_TYPE_UNAVAILABLE,
+                    409);
+            return res;
+        }
+
+        struct llama_weight_reclaim_result reclaim_result;
+        const enum llama_weight_reclaim_status reclaim_status =
+            llama_model_reclaim_weights(ctx_server.model_tgt, &reclaim_params, &reclaim_result);
+        const char * status = server_weight_reclaim_status_str(reclaim_status);
+
+        switch (reclaim_status) {
+            case LLAMA_WEIGHT_RECLAIM_SUCCESS:
+                res->ok(server_weight_reclaim_result_json(reclaim_params, reclaim_result, status));
+                return res;
+            case LLAMA_WEIGHT_RECLAIM_NOT_MANAGED:
+                res->error(format_error_response("model weights are not managed by Vulkan", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            case LLAMA_WEIGHT_RECLAIM_BUSY:
+                server_error_with_status(
+                        *res,
+                        "managed weights are busy, retry when no slot/request is processing",
+                        ERROR_TYPE_UNAVAILABLE,
+                        409);
+                return res;
+            case LLAMA_WEIGHT_RECLAIM_ERROR:
+                res->error(format_error_response("failed to reclaim managed weights", ERROR_TYPE_SERVER));
+                return res;
+        }
+
+        res->error(format_error_response("failed to reclaim managed weights", ERROR_TYPE_SERVER));
         return res;
     };
 

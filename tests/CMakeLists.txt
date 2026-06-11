@@ -247,6 +247,8 @@ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-weight-control.cpp    LABEL "model")
+llama_build_and_test(test-vulkan-managed-reclaim.cpp)
+target_include_directories(test-vulkan-managed-reclaim PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-vulkan)
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety

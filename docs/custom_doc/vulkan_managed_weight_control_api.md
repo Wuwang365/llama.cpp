@@ -22,6 +22,11 @@
 int32_t llama_model_weight_count(const struct llama_model * model);
 int32_t llama_model_weight_name(const struct llama_model * model, int32_t index, char * buf, size_t buf_size);
 enum llama_weight_unload_result llama_model_unload_weight(struct llama_model * model, const char * name);
+struct llama_weight_reclaim_params llama_model_reclaim_default_params(void);
+enum llama_weight_reclaim_status llama_model_reclaim_weights(
+    struct llama_model * model,
+    const struct llama_weight_reclaim_params * params,
+    struct llama_weight_reclaim_result * result);
 ```
 
 `llama_model_unload_weight()` 返回：
@@ -34,6 +39,24 @@ enum llama_weight_unload_result llama_model_unload_weight(struct llama_model * m
 | `LLAMA_WEIGHT_UNLOAD_NOT_RESIDENT` | 权重已经不在 resident 状态 |
 | `LLAMA_WEIGHT_UNLOAD_BUSY` | 权重当前正在使用、准备或上传 |
 | `LLAMA_WEIGHT_UNLOAD_ERROR` | 其它释放失败 |
+
+`llama_model_reclaim_weights()` 按论文式回收链批量释放 managed weight resident 内存。参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `keep_first_layers` | 保留前 N 层；小于 0 表示不保护层前缀 |
+| `target_bytes` | 本次目标回收字节数；0 表示尽量回收全部可回收节点 |
+
+返回值：
+
+| 返回值 | 含义 |
+| --- | --- |
+| `LLAMA_WEIGHT_RECLAIM_SUCCESS` | 回收流程执行完成 |
+| `LLAMA_WEIGHT_RECLAIM_NOT_MANAGED` | 当前模型权重不属于 Vulkan managed buffer，或 backend 不支持 |
+| `LLAMA_WEIGHT_RECLAIM_BUSY` | 有回收链节点仍在使用、准备或上传，导致目标未完整满足 |
+| `LLAMA_WEIGHT_RECLAIM_ERROR` | 其它失败 |
+
+`llama_weight_reclaim_result` 会返回 `reclaimed_nodes`、`reclaimed_tensors`、`reclaimed_bytes`、`kept_nodes` 和 `skipped_busy_nodes`。
 
 ## llama-server 使用方式
 
@@ -93,6 +116,35 @@ curl -s -X POST http://127.0.0.1:8080/unload_weight -d 'blk.0.attn_q.weight'
 }
 ```
 
+按回收链批量回收：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/reclaim_weights \
+  -H 'Content-Type: application/json' \
+  -d '{"policy":"chain","keep_first_layers":5,"target_mb":1024}' | jq
+```
+
+`/reclaim_weights` 当前只支持 `policy="chain"`，也可省略 `policy`。请求体可使用 `target_bytes` 或 `target_mb`，同时提供时 `target_bytes` 优先。成功时返回：
+
+```json
+{
+  "ok": true,
+  "status": "reclaimed",
+  "policy": "chain",
+  "keep_first_layers": 5,
+  "target_bytes": 1073741824,
+  "target_mb": 1024.0,
+  "reclaimed_nodes": 12,
+  "reclaimed_tensors": 84,
+  "reclaimed_bytes": 1090519040,
+  "reclaimed_mib": 1040.0,
+  "kept_nodes": 5,
+  "skipped_busy_nodes": 0
+}
+```
+
+如果 server 正在处理请求，`/reclaim_weights` 与 `/unload_weight` 一样返回 HTTP 409。
+
 ## llama-cli 使用方式
 
 进入交互模式后可直接输入：
@@ -110,7 +162,7 @@ curl -s -X POST http://127.0.0.1:8080/unload_weight -d 'blk.0.attn_q.weight'
 - server 端的并发保护粒度是整个 request/slot idle 窗口，不是 op 粒度。
 - 第一版不在 HTTP handler 内持有 Vulkan managed context 级互斥锁，依赖 server idle 检查和 backend entry 状态检查共同保护。
 - `NOT_RESIDENT` 在 server 返回中按幂等成功处理，便于重复执行卸载脚本。
-- router server 会把 `/list_weights` 和 `/unload_weight` 代理给具体模型实例。
+- router server 会把 `/list_weights`、`/unload_weight` 和 `/reclaim_weights` 代理给具体模型实例。
 
 ## 验证命令
 

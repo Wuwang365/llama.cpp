@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-vulkan-managed-reclaim.h"
 #include <vulkan/vulkan_core.h>
 #include <chrono>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
@@ -1071,6 +1072,33 @@ struct ggml_vk_managed_weight_entry {
     bool backing_released = false;
     uint64_t last_use = 0;
     uint64_t upload_value = 0;
+};
+
+struct ggml_vk_managed_reclaim_node {
+    ggml_vk_managed_reclaim_class cls;
+    size_t bytes = 0;
+    std::vector<uint64_t> keys;
+};
+
+struct ggml_vk_managed_reclaim_result {
+    size_t reclaimed_nodes = 0;
+    size_t reclaimed_tensors = 0;
+    size_t reclaimed_bytes = 0;
+    size_t skipped_busy_nodes = 0;
+    size_t kept_nodes = 0;
+};
+
+struct ggml_vk_managed_reclaim_api_params {
+    int32_t keep_first_layers = -1;
+    size_t target_bytes = 0;
+};
+
+struct ggml_vk_managed_reclaim_api_result {
+    size_t reclaimed_nodes = 0;
+    size_t reclaimed_tensors = 0;
+    size_t reclaimed_bytes = 0;
+    size_t kept_nodes = 0;
+    size_t skipped_busy_nodes = 0;
 };
 
 struct ggml_backend_vk_managed_buffer_context {
@@ -7290,6 +7318,11 @@ static bool ggml_vk_managed_flush_non_permanent_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
+static bool ggml_vk_managed_reclaim_chain_enabled() {
+    const char * env = getenv("GGML_VK_MANAGED_RECLAIM_POLICY");
+    return env != nullptr && strcmp(env, "chain") == 0;
+}
+
 static size_t ggml_vk_managed_parse_mib_env(
         const char * name,
         size_t default_limit) {
@@ -7309,6 +7342,24 @@ static size_t ggml_vk_managed_parse_mib_env(
         return 0;
     }
     return (size_t) value * mib;
+}
+
+static size_t ggml_vk_managed_reclaim_target_bytes() {
+    return ggml_vk_managed_parse_mib_env("GGML_VK_MANAGED_RECLAIM_TARGET_MB", 0);
+}
+
+static int ggml_vk_managed_reclaim_keep_first_layers() {
+    const char * env = getenv("GGML_VK_MANAGED_RECLAIM_KEEP_FIRST_LAYERS");
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+    char * end = nullptr;
+    const long value = strtol(env, &end, 10);
+    if (end == env || value < 0) {
+        GGML_LOG_WARN("ggml_vulkan: invalid GGML_VK_MANAGED_RECLAIM_KEEP_FIRST_LAYERS='%s', disabling keep-first-layers\n", env);
+        return -1;
+    }
+    return (int) value;
 }
 
 static size_t ggml_vk_managed_prefetch_inflight_limit() {
@@ -7553,12 +7604,139 @@ static void ggml_vk_managed_evict_entry(ggml_backend_vk_managed_buffer_context *
     mctx->stats_evictions++;
 }
 
+static std::vector<ggml_vk_managed_reclaim_node> ggml_vk_managed_build_reclaim_chain(
+        ggml_backend_vk_managed_buffer_context * mctx) {
+    std::vector<ggml_vk_managed_reclaim_node> nodes;
+
+    for (auto & item : mctx->entries) {
+        const uint64_t key = item.first;
+        auto & entry = item.second;
+        if (!entry.tensor) {
+            continue;
+        }
+
+        ggml_vk_managed_reclaim_class cls;
+        if (!ggml_vk_managed_reclaim_classify(ggml_get_name(entry.tensor), &cls)) {
+            continue;
+        }
+        if (cls.permanent) {
+            entry.permanent = true;
+            continue;
+        }
+        if (!cls.reclaimable) {
+            continue;
+        }
+
+        auto it = std::find_if(nodes.begin(), nodes.end(), [&](const ggml_vk_managed_reclaim_node & node) {
+            return node.cls.layer == cls.layer && node.cls.component == cls.component;
+        });
+        if (it == nodes.end()) {
+            ggml_vk_managed_reclaim_node node;
+            node.cls = cls;
+            nodes.push_back(std::move(node));
+            it = nodes.end() - 1;
+        }
+        it->bytes += entry.nbytes;
+        it->keys.push_back(key);
+    }
+
+    std::sort(nodes.begin(), nodes.end(), [](const ggml_vk_managed_reclaim_node & lhs, const ggml_vk_managed_reclaim_node & rhs) {
+        if (ggml_vk_managed_reclaim_precedes(lhs.cls, rhs.cls)) {
+            return true;
+        }
+        if (ggml_vk_managed_reclaim_precedes(rhs.cls, lhs.cls)) {
+            return false;
+        }
+        return lhs.keys.size() > rhs.keys.size();
+    });
+
+    return nodes;
+}
+
+static bool ggml_vk_managed_reclaim_node_selected(
+        const ggml_vk_managed_reclaim_node & node,
+        int keep_first_layers) {
+    if (keep_first_layers < 0) {
+        return true;
+    }
+    return node.cls.layer >= keep_first_layers;
+}
+
+static ggml_vk_managed_reclaim_result ggml_vk_managed_reclaim_prefix(
+        ggml_backend_vk_managed_buffer_context * mctx,
+        size_t target_bytes,
+        int keep_first_layers) {
+    ggml_vk_managed_reclaim_result result;
+    const bool unlimited = target_bytes == 0;
+    const auto nodes = ggml_vk_managed_build_reclaim_chain(mctx);
+
+    for (const auto & node : nodes) {
+        if (!ggml_vk_managed_reclaim_node_selected(node, keep_first_layers)) {
+            result.kept_nodes++;
+            continue;
+        }
+        if (!unlimited && result.reclaimed_bytes >= target_bytes) {
+            break;
+        }
+
+        bool has_resident = false;
+        bool busy = false;
+        size_t resident_bytes = 0;
+        size_t resident_tensors = 0;
+        for (const auto key : node.keys) {
+            auto it = mctx->entries.find(key);
+            if (it == mctx->entries.end()) {
+                continue;
+            }
+            auto & entry = it->second;
+            if (!entry.resident) {
+                continue;
+            }
+            has_resident = true;
+            if (entry.preparing || entry.uploading || entry.in_use || entry.permanent) {
+                busy = true;
+                break;
+            }
+            resident_bytes += entry.nbytes;
+            resident_tensors++;
+        }
+        if (!has_resident) {
+            continue;
+        }
+        if (busy) {
+            result.skipped_busy_nodes++;
+            continue;
+        }
+
+        for (const auto key : node.keys) {
+            auto it = mctx->entries.find(key);
+            if (it == mctx->entries.end() || !it->second.resident) {
+                continue;
+            }
+            ggml_vk_managed_evict_entry(mctx, it->second);
+        }
+
+        result.reclaimed_nodes++;
+        result.reclaimed_tensors += resident_tensors;
+        result.reclaimed_bytes += resident_bytes;
+    }
+
+    return result;
+}
+
 enum ggml_vk_managed_unload_result {
     GGML_VK_MANAGED_UNLOAD_SUCCESS = 0,
     GGML_VK_MANAGED_UNLOAD_NOT_MANAGED,
     GGML_VK_MANAGED_UNLOAD_NOT_RESIDENT,
     GGML_VK_MANAGED_UNLOAD_BUSY,
     GGML_VK_MANAGED_UNLOAD_ERROR,
+};
+
+enum ggml_vk_managed_reclaim_api_status {
+    GGML_VK_MANAGED_RECLAIM_API_SUCCESS = 0,
+    GGML_VK_MANAGED_RECLAIM_API_NOT_MANAGED,
+    GGML_VK_MANAGED_RECLAIM_API_BUSY,
+    GGML_VK_MANAGED_RECLAIM_API_ERROR,
 };
 
 static bool ggml_backend_vk_managed_buffer_is_managed_tensor(const ggml_tensor * tensor) {
@@ -7598,6 +7776,82 @@ static int ggml_backend_vk_managed_buffer_unload_tensor(ggml_tensor * tensor) {
     return GGML_VK_MANAGED_UNLOAD_SUCCESS;
 }
 
+static void ggml_vk_managed_reclaim_accumulate(
+        ggml_vk_managed_reclaim_result & total,
+        const ggml_vk_managed_reclaim_result & partial) {
+    total.reclaimed_nodes += partial.reclaimed_nodes;
+    total.reclaimed_tensors += partial.reclaimed_tensors;
+    total.reclaimed_bytes += partial.reclaimed_bytes;
+    total.skipped_busy_nodes += partial.skipped_busy_nodes;
+    total.kept_nodes += partial.kept_nodes;
+}
+
+static void ggml_vk_managed_reclaim_api_copy_result(
+        ggml_vk_managed_reclaim_api_result * dst,
+        const ggml_vk_managed_reclaim_result & src) {
+    if (!dst) {
+        return;
+    }
+
+    dst->reclaimed_nodes = src.reclaimed_nodes;
+    dst->reclaimed_tensors = src.reclaimed_tensors;
+    dst->reclaimed_bytes = src.reclaimed_bytes;
+    dst->kept_nodes = src.kept_nodes;
+    dst->skipped_busy_nodes = src.skipped_busy_nodes;
+}
+
+static int ggml_backend_vk_managed_buffer_reclaim_weights(
+        ggml_tensor ** tensors,
+        int32_t n_tensors,
+        const void * params_ptr,
+        void * result_ptr) {
+    const auto * params = (const ggml_vk_managed_reclaim_api_params *) params_ptr;
+    auto * result = (ggml_vk_managed_reclaim_api_result *) result_ptr;
+
+    if (result) {
+        *result = {};
+    }
+    if (!tensors || n_tensors <= 0) {
+        return GGML_VK_MANAGED_RECLAIM_API_NOT_MANAGED;
+    }
+
+    const int keep_first_layers = params ? params->keep_first_layers : -1;
+    const size_t target_bytes = params ? params->target_bytes : 0;
+
+    bool has_managed_tensor = false;
+    ggml_vk_managed_reclaim_result total;
+    std::set<ggml_backend_vk_managed_buffer_context *> seen;
+
+    for (int32_t i = 0; i < n_tensors; ++i) {
+        ggml_tensor * tensor = tensors[i];
+        if (!tensor || !ggml_vk_tensor_is_managed(tensor)) {
+            continue;
+        }
+
+        has_managed_tensor = true;
+        ggml_backend_vk_managed_buffer_context * mctx = ggml_vk_managed_context(tensor);
+        if (!mctx || !seen.insert(mctx).second) {
+            continue;
+        }
+        if (target_bytes != 0 && total.reclaimed_bytes >= target_bytes) {
+            break;
+        }
+
+        const size_t context_target = target_bytes == 0 ? 0 : target_bytes - total.reclaimed_bytes;
+        const auto partial = ggml_vk_managed_reclaim_prefix(mctx, context_target, keep_first_layers);
+        ggml_vk_managed_reclaim_accumulate(total, partial);
+    }
+
+    ggml_vk_managed_reclaim_api_copy_result(result, total);
+    if (!has_managed_tensor) {
+        return GGML_VK_MANAGED_RECLAIM_API_NOT_MANAGED;
+    }
+    if (total.skipped_busy_nodes > 0 && (target_bytes == 0 || total.reclaimed_bytes < target_bytes)) {
+        return GGML_VK_MANAGED_RECLAIM_API_BUSY;
+    }
+    return GGML_VK_MANAGED_RECLAIM_API_SUCCESS;
+}
+
 static void ggml_vk_managed_flush_non_permanent(ggml_backend_vk_context * ctx) {
     if (!ggml_vk_managed_flush_non_permanent_enabled() || !ctx->managed_graph_active) {
         return;
@@ -7606,6 +7860,40 @@ static void ggml_vk_managed_flush_non_permanent(ggml_backend_vk_context * ctx) {
     // Make sure no previous upload/compute still owns buffers before destroying them.
     ggml_vk_synchronize(ctx);
     ggml_vk_managed_finalize_graph_uploads(ctx, true);
+
+    if (ggml_vk_managed_reclaim_chain_enabled()) {
+        const size_t target_bytes = ggml_vk_managed_reclaim_target_bytes();
+        const int keep_first_layers = ggml_vk_managed_reclaim_keep_first_layers();
+        ggml_vk_managed_reclaim_result total;
+
+        {
+            std::lock_guard<std::mutex> lock(ctx->managed_mutex);
+            std::set<ggml_backend_vk_managed_buffer_context *> seen;
+            for (auto * mctx : ctx->managed_graph_contexts) {
+                if (!mctx || !seen.insert(mctx).second) {
+                    continue;
+                }
+                if (target_bytes != 0 && total.reclaimed_bytes >= target_bytes) {
+                    break;
+                }
+
+                const size_t context_target = target_bytes == 0 ? 0 : target_bytes - total.reclaimed_bytes;
+                const auto result = ggml_vk_managed_reclaim_prefix(mctx, context_target, keep_first_layers);
+                ggml_vk_managed_reclaim_accumulate(total, result);
+            }
+        }
+
+        GGML_LOG_INFO(
+            "ggml_vulkan: managed reclaim chain reclaimed=%zu nodes %zu tensors %.2f MiB kept=%zu nodes skipped_busy=%zu target=%.2f MiB keep_first_layers=%d\n",
+            total.reclaimed_nodes,
+            total.reclaimed_tensors,
+            (double) total.reclaimed_bytes / (1024.0 * 1024.0),
+            total.kept_nodes,
+            total.skipped_busy_nodes,
+            (double) target_bytes / (1024.0 * 1024.0),
+            keep_first_layers);
+        return;
+    }
 
     size_t flushed_tensors = 0;
     size_t skipped_tensors = 0;
@@ -7667,6 +7955,22 @@ static void ggml_vk_managed_ensure_capacity(ggml_backend_vk_managed_buffer_conte
         GGML_ABORT("managed Vulkan cache capacity too small");
     }
     while (mctx->cache_used + nbytes > mctx->cache_capacity) {
+        if (ggml_vk_managed_reclaim_chain_enabled()) {
+            const size_t needed = mctx->cache_used + nbytes - mctx->cache_capacity;
+            const auto result = ggml_vk_managed_reclaim_prefix(mctx, needed, -1);
+            if (result.reclaimed_bytes != 0 && getenv("GGML_VK_MANAGED_DEBUG")) {
+                fprintf(stderr,
+                    "ggml_vulkan: managed reclaim capacity reclaimed=%zu tensors %.2f MiB needed=%.2f MiB skipped_busy=%zu\n",
+                    result.reclaimed_tensors,
+                    (double) result.reclaimed_bytes / (1024.0 * 1024.0),
+                    (double) needed / (1024.0 * 1024.0),
+                    result.skipped_busy_nodes);
+            }
+            if (mctx->cache_used + nbytes <= mctx->cache_capacity) {
+                return;
+            }
+        }
+
         ggml_vk_managed_weight_entry * victim = nullptr;
         for (auto & item : mctx->entries) {
             auto & entry = item.second;
@@ -19303,6 +19607,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_vk_managed_buffer_unload_tensor") == 0) {
         return (void *) ggml_backend_vk_managed_buffer_unload_tensor;
+    }
+    if (strcmp(name, "ggml_backend_vk_managed_buffer_reclaim_weights") == 0) {
+        return (void *) ggml_backend_vk_managed_buffer_reclaim_weights;
     }
     return nullptr;
 }

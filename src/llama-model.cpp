@@ -2630,6 +2630,22 @@ int32_t llama_model_weight_name(const llama_model * model, int32_t index, char *
 using ggml_backend_vk_managed_buffer_is_managed_tensor_t = bool (*)(const ggml_tensor * tensor);
 using ggml_backend_vk_managed_buffer_unload_tensor_t = int (*)(ggml_tensor * tensor);
 
+struct llama_vk_weight_reclaim_params {
+    int32_t keep_first_layers;
+    size_t target_bytes;
+};
+
+struct llama_vk_weight_reclaim_result {
+    size_t reclaimed_nodes;
+    size_t reclaimed_tensors;
+    size_t reclaimed_bytes;
+    size_t kept_nodes;
+    size_t skipped_busy_nodes;
+};
+
+using ggml_backend_vk_managed_buffer_reclaim_weights_t =
+    int (*)(ggml_tensor ** tensors, int32_t n_tensors, const void * params, void * result);
+
 enum llama_weight_unload_result llama_model_unload_weight(llama_model * model, const char * name) {
     if (!model || !name || name[0] == '\0') {
         return LLAMA_WEIGHT_UNLOAD_NOT_FOUND;
@@ -2670,6 +2686,74 @@ enum llama_weight_unload_result llama_model_unload_weight(llama_model * model, c
             return LLAMA_WEIGHT_UNLOAD_NOT_MANAGED;
         default:
             return LLAMA_WEIGHT_UNLOAD_ERROR;
+    }
+}
+
+struct llama_weight_reclaim_params llama_model_reclaim_default_params(void) {
+    struct llama_weight_reclaim_params params;
+    params.keep_first_layers = -1;
+    params.target_bytes = 0;
+    return params;
+}
+
+enum llama_weight_reclaim_status llama_model_reclaim_weights(
+        llama_model * model,
+        const struct llama_weight_reclaim_params * params,
+        struct llama_weight_reclaim_result * result) {
+    if (result) {
+        *result = {};
+    }
+
+    if (!model) {
+        return LLAMA_WEIGHT_RECLAIM_ERROR;
+    }
+
+    auto * reg = ggml_backend_reg_by_name("Vulkan");
+    if (!reg) {
+        return LLAMA_WEIGHT_RECLAIM_NOT_MANAGED;
+    }
+
+    auto * reclaim_fn = (ggml_backend_vk_managed_buffer_reclaim_weights_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_managed_buffer_reclaim_weights");
+    if (!reclaim_fn) {
+        return LLAMA_WEIGHT_RECLAIM_NOT_MANAGED;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    tensors.reserve(model->tensors_by_name.size());
+    for (const auto & item : model->tensors_by_name) {
+        tensors.push_back(item.second);
+    }
+    if (tensors.empty()) {
+        return LLAMA_WEIGHT_RECLAIM_NOT_MANAGED;
+    }
+
+    const struct llama_weight_reclaim_params defaults = llama_model_reclaim_default_params();
+    const struct llama_weight_reclaim_params * effective_params = params ? params : &defaults;
+    const llama_vk_weight_reclaim_params vk_params {
+        effective_params->keep_first_layers,
+        effective_params->target_bytes,
+    };
+    llama_vk_weight_reclaim_result vk_result {};
+
+    const int status = reclaim_fn(tensors.data(), (int32_t) tensors.size(), &vk_params, &vk_result);
+    if (result) {
+        result->reclaimed_nodes = vk_result.reclaimed_nodes;
+        result->reclaimed_tensors = vk_result.reclaimed_tensors;
+        result->reclaimed_bytes = vk_result.reclaimed_bytes;
+        result->kept_nodes = vk_result.kept_nodes;
+        result->skipped_busy_nodes = vk_result.skipped_busy_nodes;
+    }
+
+    switch (status) {
+        case 0:
+            return LLAMA_WEIGHT_RECLAIM_SUCCESS;
+        case 1:
+            return LLAMA_WEIGHT_RECLAIM_NOT_MANAGED;
+        case 2:
+            return LLAMA_WEIGHT_RECLAIM_BUSY;
+        default:
+            return LLAMA_WEIGHT_RECLAIM_ERROR;
     }
 }
 

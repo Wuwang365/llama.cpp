@@ -647,6 +647,29 @@ extern "C" {
         LLAMA_WEIGHT_UNLOAD_ERROR,
     };
 
+    enum llama_weight_reclaim_status {
+        LLAMA_WEIGHT_RECLAIM_SUCCESS = 0,
+        LLAMA_WEIGHT_RECLAIM_NOT_MANAGED,
+        LLAMA_WEIGHT_RECLAIM_BUSY,
+        LLAMA_WEIGHT_RECLAIM_ERROR,
+    };
+
+    struct llama_weight_reclaim_params {
+        // Number of initial transformer layers to keep resident. Negative means no layer prefix is protected.
+        int32_t keep_first_layers;
+
+        // Target bytes to reclaim across the model. Zero means reclaim every eligible chain node.
+        size_t target_bytes;
+    };
+
+    struct llama_weight_reclaim_result {
+        size_t reclaimed_nodes;
+        size_t reclaimed_tensors;
+        size_t reclaimed_bytes;
+        size_t kept_nodes;
+        size_t skipped_busy_nodes;
+    };
+
     // Returns the number of named model weight tensors.
     LLAMA_API int32_t llama_model_weight_count(const struct llama_model * model);
 
@@ -657,6 +680,18 @@ extern "C" {
     // Releases backend resident memory for a named weight when supported.
     // This does not remove model metadata or mmap backing; future graph use can reload the weight.
     LLAMA_API enum llama_weight_unload_result llama_model_unload_weight(struct llama_model * model, const char * name);
+
+    // Default managed-weight reclaim parameters.
+    // By default, all eligible chain nodes can be reclaimed and there is no target byte limit.
+    LLAMA_API struct llama_weight_reclaim_params llama_model_reclaim_default_params(void);
+
+    // Reclaims backend resident memory by the managed-weight reclaim chain when supported.
+    // This does not remove model metadata or mmap backing; future graph use can reload the weights.
+    // The result struct is cleared before being filled, including on failure.
+    LLAMA_API enum llama_weight_reclaim_status llama_model_reclaim_weights(
+            struct llama_model * model,
+            const struct llama_weight_reclaim_params * params,
+            struct llama_weight_reclaim_result * result);
 
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
